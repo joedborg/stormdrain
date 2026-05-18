@@ -4,6 +4,10 @@ A command-line BitTorrent client modelled after `curl` and `wget`. Pass it a
 `.torrent` file, an HTTP(S) URL to one, or a magnet link and it downloads the
 content to disk.
 
+## Why?
+
+Sometimes, I just want to download a torrent. Existing applications are require a daemon running in the background, or have a large GUI with features I don't need. `stormdrain` is a simple tool that just downloads torrents.
+
 ## Features
 
 - `.torrent` files, HTTP(S) `.torrent` URLs, and magnet links
