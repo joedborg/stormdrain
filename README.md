@@ -21,7 +21,11 @@ Sometimes, I just want to download a torrent. Existing applications are require 
 
 ## Installation
 
-Requires Rust 1.85 or later (edition 2024).
+```
+cargo install stormdrain
+```
+
+Or from source (requires Rust 1.85 or later, edition 2024):
 
 ```
 git clone https://github.com/you/stormdrain
