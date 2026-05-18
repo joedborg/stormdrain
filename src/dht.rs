@@ -73,8 +73,6 @@ pub struct DhtNode {
 // Routing table (simplified — flat list, not full k-bucket tree)
 /// Simplified flat routing table (not a full k-bucket tree).
 pub struct RoutingTable {
-    #[allow(dead_code)]
-    own_id: NodeId,
     /// Nodes ordered by XOR distance, capped at `K * 8` entries.
     nodes: Vec<DhtNode>,
 }
@@ -82,12 +80,9 @@ pub struct RoutingTable {
 const K: usize = 20; // k-bucket size
 
 impl RoutingTable {
-    /// Create an empty routing table for node `own_id`.
-    pub fn new(own_id: NodeId) -> Self {
-        RoutingTable {
-            own_id,
-            nodes: Vec::new(),
-        }
+    /// Create an empty routing table.
+    pub fn new() -> Self {
+        RoutingTable { nodes: Vec::new() }
     }
 
     /// Add or refresh a node in the routing table.
@@ -140,8 +135,6 @@ struct DhtInner {
 
 struct PendingQuery {
     tx: mpsc::UnboundedSender<DhtEvent>,
-    #[allow(dead_code)]
-    sent_at: Instant,
 }
 
 #[derive(Debug)]
@@ -160,7 +153,7 @@ impl Dht {
             inner: Arc::new(DhtInner {
                 socket,
                 own_id,
-                table: Mutex::new(RoutingTable::new(own_id)),
+                table: Mutex::new(RoutingTable::new()),
                 pending: Mutex::new(HashMap::new()),
             }),
         };
@@ -379,13 +372,11 @@ impl Dht {
         let msg = build_query(b"get_peers", &tid, &self.inner.own_id, |a| {
             a.insert(b"info_hash".to_vec(), Value::Bytes(info_hash.0.to_vec()));
         });
-        self.inner.pending.lock().await.insert(
-            tid,
-            PendingQuery {
-                tx,
-                sent_at: Instant::now(),
-            },
-        );
+        self.inner
+            .pending
+            .lock()
+            .await
+            .insert(tid, PendingQuery { tx });
         let _ = self.inner.socket.send_to(&bencode_encode(&msg), to).await;
         tid
     }
@@ -557,13 +548,13 @@ mod tests {
 
     #[test]
     fn routing_table_starts_empty() {
-        let rt = RoutingTable::new(NodeId::random());
+        let rt = RoutingTable::new();
         assert_eq!(rt.len(), 0);
     }
 
     #[test]
     fn routing_table_add_increases_len() {
-        let mut rt = RoutingTable::new(NodeId::random());
+        let mut rt = RoutingTable::new();
         rt.add(make_node([1u8; 20], 1));
         rt.add(make_node([2u8; 20], 2));
         assert_eq!(rt.len(), 2);
@@ -571,7 +562,7 @@ mod tests {
 
     #[test]
     fn routing_table_add_refreshes_existing_node() {
-        let mut rt = RoutingTable::new(NodeId::random());
+        let mut rt = RoutingTable::new();
         rt.add(make_node([1u8; 20], 1));
         rt.add(make_node([1u8; 20], 2)); // same ID, different addr
         assert_eq!(rt.len(), 1);
@@ -581,7 +572,7 @@ mod tests {
     #[test]
     fn routing_table_closest_returns_k_nearest() {
         let target = NodeId([0u8; 20]);
-        let mut rt = RoutingTable::new(NodeId::random());
+        let mut rt = RoutingTable::new();
         // Add nodes at increasing distances from target.
         for i in 1u8..=10 {
             let mut id = [0u8; 20];
@@ -596,7 +587,7 @@ mod tests {
 
     #[test]
     fn routing_table_closest_returns_all_when_fewer_than_k() {
-        let mut rt = RoutingTable::new(NodeId::random());
+        let mut rt = RoutingTable::new();
         rt.add(make_node([1u8; 20], 1));
         rt.add(make_node([2u8; 20], 2));
         let closest = rt.closest(&NodeId::random(), 10);

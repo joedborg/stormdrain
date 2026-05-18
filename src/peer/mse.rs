@@ -229,7 +229,9 @@ pub async fn perform_initiator(mut stream: TcpStream, info_hash: &InfoHash) -> R
     // Step 8: Derive RC4 keys.
     let key_a = sha1_hash(&[b"keyA", s_bytes.as_slice(), info_hash.as_bytes()]);
     let key_b = sha1_hash(&[b"keyB", s_bytes.as_slice(), info_hash.as_bytes()]);
+    // codeql[rust/weak-cryptographic-algorithm] RC4 is required by BEP-6 (MSE/PE); no alternative is permitted by the spec.
     let mut enc_rc4 = Rc4::new(&key_a); // we encrypt with keyA
+    // codeql[rust/weak-cryptographic-algorithm]
     let mut dec_rc4 = Rc4::new(&key_b); // we decrypt with keyB
 
     // Step 9: Encrypt and send VC || crypto_provide || len(padC) || padC || len(IA) || IA
@@ -321,10 +323,12 @@ mod tests {
         let key = b"secret-key-12345";
         let plaintext = b"Hello, BitTorrent world!";
 
+        // codeql[rust/weak-cryptographic-algorithm]
         let mut enc = Rc4::new(key);
         let ciphertext = enc.encrypt(plaintext);
         assert_ne!(&ciphertext, plaintext);
 
+        // codeql[rust/weak-cryptographic-algorithm]
         let mut dec = Rc4::new(key);
         let mut buf = ciphertext.clone();
         dec.decrypt(&mut buf);
@@ -338,7 +342,9 @@ mod tests {
         let key = b"test";
         let original = vec![0x01u8, 0x02, 0x03, 0x04, 0x05];
         let mut buf = original.clone();
+        // codeql[rust/weak-cryptographic-algorithm]
         Rc4::new(key).apply(&mut buf);
+        // codeql[rust/weak-cryptographic-algorithm]
         Rc4::new(key).apply(&mut buf); // fresh instance → same keystream → restores original
         assert_eq!(buf, original);
     }
@@ -346,7 +352,9 @@ mod tests {
     #[test]
     fn rc4_different_keys_produce_different_ciphertext() {
         let msg = b"same plaintext";
+        // codeql[rust/weak-cryptographic-algorithm]
         let mut enc1 = Rc4::new(b"key1");
+        // codeql[rust/weak-cryptographic-algorithm]
         let mut enc2 = Rc4::new(b"key2");
         let c1 = enc1.encrypt(msg);
         let c2 = enc2.encrypt(msg);
@@ -355,6 +363,7 @@ mod tests {
 
     #[test]
     fn rc4_empty_input_is_no_op() {
+        // codeql[rust/weak-cryptographic-algorithm]
         let mut rc4 = Rc4::new(b"key");
         let mut buf: Vec<u8> = vec![];
         rc4.apply(&mut buf);
