@@ -221,7 +221,8 @@ mod tests {
 
     #[test]
     fn unknown_params_are_ignored() {
-        let uri = format!("magnet:?xt=urn:btih:{HEX_HASH}&ws=http%3A%2F%2Fexample.com%2Fseed&xl=65536");
+        let uri =
+            format!("magnet:?xt=urn:btih:{HEX_HASH}&ws=http%3A%2F%2Fexample.com%2Fseed&xl=65536");
         let m = MagnetLink::parse(&uri).unwrap();
         // ws and xl are ignored; the parse should still succeed.
         assert_eq!(m.info_hash.to_hex(), HEX_HASH);

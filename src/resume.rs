@@ -18,7 +18,12 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest as _, Sha1};
 use tokio::fs;
 
-use crate::{error::{Error, Result}, metainfo::Metainfo, piece_manager::PieceManager, types::InfoHash};
+use crate::{
+    error::{Error, Result},
+    metainfo::Metainfo,
+    piece_manager::PieceManager,
+    types::InfoHash,
+};
 
 /// Persisted download state used for fast-resume across restarts.
 #[derive(Debug, Serialize, Deserialize, Default)]

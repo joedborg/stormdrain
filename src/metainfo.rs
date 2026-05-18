@@ -316,9 +316,11 @@ mod tests {
         let meta = Metainfo::from_bytes(&data).unwrap();
         // At least one tier with the announce URL.
         assert!(!meta.trackers.is_empty());
-        assert!(meta.trackers[0]
-            .iter()
-            .any(|u| u.contains("tracker.example.com")));
+        assert!(
+            meta.trackers[0]
+                .iter()
+                .any(|u| u.contains("tracker.example.com"))
+        );
     }
 
     #[test]

@@ -129,7 +129,9 @@ mod tests {
     async fn write_and_read_single_file() {
         let dir = tempfile::tempdir().unwrap();
         let files = vec![make_file_info("data.bin", 1024, 0)];
-        let fw = FileWriter::new(dir.path().to_owned(), &files).await.unwrap();
+        let fw = FileWriter::new(dir.path().to_owned(), &files)
+            .await
+            .unwrap();
 
         let data = vec![0xABu8; 1024];
         fw.write_piece(0, &data).await.unwrap();
@@ -142,7 +144,9 @@ mod tests {
     async fn write_partial_and_read_subset() {
         let dir = tempfile::tempdir().unwrap();
         let files = vec![make_file_info("data.bin", 512, 0)];
-        let fw = FileWriter::new(dir.path().to_owned(), &files).await.unwrap();
+        let fw = FileWriter::new(dir.path().to_owned(), &files)
+            .await
+            .unwrap();
 
         let mut data = vec![0u8; 512];
         data[100] = 0xFF;
@@ -161,7 +165,9 @@ mod tests {
             make_file_info("part0.bin", 512, 0),
             make_file_info("part1.bin", 512, 512),
         ];
-        let fw = FileWriter::new(dir.path().to_owned(), &files).await.unwrap();
+        let fw = FileWriter::new(dir.path().to_owned(), &files)
+            .await
+            .unwrap();
 
         // Write 512 bytes that span the boundary (bytes 256..768).
         let data = vec![0xCCu8; 512];
@@ -177,7 +183,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let files = vec![make_file_info("subdir/nested/data.bin", 256, 0)];
         // Should succeed even though subdir/nested does not exist yet.
-        let fw = FileWriter::new(dir.path().to_owned(), &files).await.unwrap();
+        let fw = FileWriter::new(dir.path().to_owned(), &files)
+            .await
+            .unwrap();
         let data = vec![42u8; 256];
         fw.write_piece(0, &data).await.unwrap();
         assert!(dir.path().join("subdir").join("nested").exists());

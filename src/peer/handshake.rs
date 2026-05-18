@@ -79,9 +79,13 @@ pub async fn perform<S: AsyncRead + AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
-    fn make_handshake_response(info_hash: &InfoHash, peer_id: [u8; 20], reserved: [u8; 8]) -> [u8; 68] {
+    fn make_handshake_response(
+        info_hash: &InfoHash,
+        peer_id: [u8; 20],
+        reserved: [u8; 8],
+    ) -> [u8; 68] {
         let mut resp = [0u8; 68];
         resp[0] = 19;
         resp[1..20].copy_from_slice(b"BitTorrent protocol");

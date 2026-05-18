@@ -9,7 +9,7 @@
 use std::net::SocketAddr;
 
 use tokio::net::UdpSocket;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 use crate::{
     error::{Error, Result},
@@ -47,19 +47,24 @@ pub async fn announce(req: &AnnounceRequest<'_>, url: &str) -> Result<AnnounceRe
     socket.send(&connect_req).await?;
 
     let mut buf = [0u8; 1024];
-    let n = recv_timeout(&socket, &mut buf, Duration::from_secs(15)).await
+    let n = recv_timeout(&socket, &mut buf, Duration::from_secs(15))
+        .await
         .map_err(|_| Error::Tracker("UDP connect timeout".into()))?;
 
     if n < 16 {
         return Err(Error::Tracker("UDP connect response too short".into()));
     }
     let resp_action = u32_be(&buf, 0);
-    let resp_txid   = u32_be(&buf, 4);
+    let resp_txid = u32_be(&buf, 4);
     if resp_action != ACTION_CONNECT {
-        return Err(Error::Tracker(format!("UDP connect: unexpected action {resp_action}")));
+        return Err(Error::Tracker(format!(
+            "UDP connect: unexpected action {resp_action}"
+        )));
     }
     if resp_txid != transaction_id {
-        return Err(Error::Tracker("UDP connect: transaction ID mismatch".into()));
+        return Err(Error::Tracker(
+            "UDP connect: transaction ID mismatch".into(),
+        ));
     }
     let connection_id = u64::from_be_bytes(buf[8..16].try_into().unwrap());
 
@@ -75,9 +80,9 @@ pub async fn announce(req: &AnnounceRequest<'_>, url: &str) -> Result<AnnounceRe
     ann[64..72].copy_from_slice(&req.left.to_be_bytes());
     ann[72..80].copy_from_slice(&req.uploaded.to_be_bytes());
     let event_code: u32 = match req.event {
-        None | Some(Event::Started)   => 2, // "started" = 2 in UDP
-        Some(Event::Completed)        => 1,
-        Some(Event::Stopped)          => 3,
+        None | Some(Event::Started) => 2, // "started" = 2 in UDP
+        Some(Event::Completed) => 1,
+        Some(Event::Stopped) => 3,
     };
     ann[80..84].copy_from_slice(&event_code.to_be_bytes());
     ann[84..88].fill(0); // IP (0 = default)
@@ -89,14 +94,17 @@ pub async fn announce(req: &AnnounceRequest<'_>, url: &str) -> Result<AnnounceRe
     socket.send(&ann).await?;
 
     let mut rbuf = [0u8; 65536];
-    let n = recv_timeout(&socket, &mut rbuf, Duration::from_secs(15)).await
+    let n = recv_timeout(&socket, &mut rbuf, Duration::from_secs(15))
+        .await
         .map_err(|_| Error::Tracker("UDP announce timeout".into()))?;
 
     if n < 20 {
-        return Err(Error::Tracker(format!("UDP announce response too short: {n}")));
+        return Err(Error::Tracker(format!(
+            "UDP announce response too short: {n}"
+        )));
     }
     let resp_action = u32_be(&rbuf, 0);
-    let resp_txid   = u32_be(&rbuf, 4);
+    let resp_txid = u32_be(&rbuf, 4);
 
     if resp_action == 3 {
         // Error response
@@ -104,17 +112,25 @@ pub async fn announce(req: &AnnounceRequest<'_>, url: &str) -> Result<AnnounceRe
         return Err(Error::Tracker(format!("UDP tracker error: {msg}")));
     }
     if resp_action != ACTION_ANNOUNCE {
-        return Err(Error::Tracker(format!("UDP announce: unexpected action {resp_action}")));
+        return Err(Error::Tracker(format!(
+            "UDP announce: unexpected action {resp_action}"
+        )));
     }
     if resp_txid != transaction_id2 {
-        return Err(Error::Tracker("UDP announce: transaction ID mismatch".into()));
+        return Err(Error::Tracker(
+            "UDP announce: transaction ID mismatch".into(),
+        ));
     }
 
     let interval = u32_be(&rbuf, 8) as u64;
     // Leechers @ 12, seeders @ 16 — unused for now
     let peers = parse_compact_peers(&rbuf[20..n]);
 
-    Ok(AnnounceResponse { peers, interval, warning: None })
+    Ok(AnnounceResponse {
+        peers,
+        interval,
+        warning: None,
+    })
 }
 
 fn parse_compact_peers(data: &[u8]) -> Vec<PeerAddr> {
@@ -123,7 +139,10 @@ fn parse_compact_peers(data: &[u8]) -> Vec<PeerAddr> {
     for chunk in data.chunks_exact(6) {
         let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
         let port = u16::from_be_bytes([chunk[4], chunk[5]]);
-        out.push(PeerAddr { ip: IpAddr::V4(ip), port });
+        out.push(PeerAddr {
+            ip: IpAddr::V4(ip),
+            port,
+        });
     }
     out
 }
