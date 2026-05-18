@@ -1,0 +1,36 @@
+[package]
+name = "stormdrain"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+authors = ["Joe Borg <joe@josephb.org>"]
+description = "A BitTorrent client library"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+sha1 = "0.11"
+rand = "0.10"
+hex = "0.4"
+url = "2"
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "stream",
+] }
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+num-bigint = "0.4"
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.18"
+anyhow = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
