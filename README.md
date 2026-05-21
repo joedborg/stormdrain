@@ -109,7 +109,7 @@ the engine in your own application:
 
 ```toml
 [dependencies]
-stormdrain = { path = "." }
+stormdrain = "0.1.0"
 ```
 
 ```rust
