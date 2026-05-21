@@ -6,7 +6,7 @@ content to disk.
 
 ## Why?
 
-Sometimes, I just want to download a torrent. Existing applications are require a daemon running in the background, or have a large GUI with features I don't need. `stormdrain` is a simple tool that just downloads torrents.
+Sometimes, I just want to download a torrent. Existing applications require a daemon running in the background, or have a large GUI with features I don't need. `stormdrain` is a simple tool that just downloads torrents.
 
 ## Features
 
