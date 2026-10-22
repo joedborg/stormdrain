@@ -161,40 +161,6 @@ src/
       display.rs       progress bar + human_size()
 ```
 
-## Releasing
-
-Before the first automated publication, configure a GitHub trusted publisher in
-the `stormdrain` crate's settings on crates.io:
-
-- Repository owner: `joedborg`
-- Repository name: `stormdrain`
-- Workflow filename: `release.yml`
-- Environment: leave unset (the publishing job does not use a GitHub environment)
-
-The workflow uses GitHub OIDC to obtain a short-lived crates.io token; no
-`CARGO_REGISTRY_TOKEN` repository secret is needed. See the
-[crates.io trusted publishing documentation](https://crates.io/docs/trusted-publishing).
-
-1. Update `package.version` in `Cargo.toml` and the corresponding version in
-   `Cargo.lock`, then commit and push the changes.
-2. In GitHub, open **Actions > Release > Run workflow**.
-3. Select the branch containing the release commit and enter its tag, including
-   the `v` prefix (for example, `v0.1.2` for version `0.1.2`).
-
-The workflow checks that the tag exactly matches `Cargo.toml` and does not
-already exist, runs the test workflow, and builds Linux, macOS, and Windows
-binaries. After all checks and builds succeed, it verifies the crate package and
-publishes it to crates.io from the selected commit. Only after crates.io
-publication succeeds does it create a draft GitHub release targeting that same
-commit, upload all binaries, and publish the release.
-Do not create the tag or release manually beforehand.
-
-Crates.io publication and GitHub publication are not atomic: a published crate
-cannot be overwritten if a later GitHub step fails. If GitHub release creation,
-upload, or publication fails, inspect the run and clean up any incomplete draft
-or tag it created, then use **Re-run failed jobs** so the successful crates.io job
-is not repeated. Do not start a fresh run for an already-published crate version.
-
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
