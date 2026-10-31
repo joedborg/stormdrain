@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag (must match Cargo.toml, e.g. v1.1.1)
+        description: Release tag (must match Cargo.toml and Cargo.lock, e.g. v1.1.1)
         required: true
         type: string
 
@@ -30,11 +30,40 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          version=$(cargo metadata --no-deps --format-version 1 --locked |
-            jq -er --arg manifest "$GITHUB_WORKSPACE/Cargo.toml" \
-              '.packages[] | select(.manifest_path == $manifest) | .version')
+          package=$(cargo metadata --no-deps --format-version 1 --locked |
+            jq -ec --arg manifest "$GITHUB_WORKSPACE/Cargo.toml" \
+              '.packages[] | select(.manifest_path == $manifest)')
+          version=$(jq -er '.version' <<< "$package")
+          name=$(jq -er '.name' <<< "$package")
           if [ "$RELEASE_TAG" != "v$version" ]; then
             echo "::error::Tag $RELEASE_TAG does not match Cargo.toml version $version"
+            exit 1
+          fi
+          lock_version=$(awk -F '"' -v name="$name" '
+            function check_package() {
+              if (package_name == name && !source) {
+                count++
+                lock_version = package_version
+              }
+            }
+            /^\[\[package\]\]$/ {
+              check_package()
+              package_name = package_version = source = ""
+            }
+            /^name = / { package_name = $2 }
+            /^version = / { package_version = $2 }
+            /^source = / { source = $2 }
+            END {
+              check_package()
+              if (count != 1 || lock_version == "") {
+                print "::error::Expected exactly one local package " name " with a version in Cargo.lock" > "/dev/stderr"
+                exit 1
+              }
+              print lock_version
+            }
+          ' Cargo.lock)
+          if [ "$RELEASE_TAG" != "v$lock_version" ]; then
+            echo "::error::Tag $RELEASE_TAG does not match Cargo.lock version $lock_version"
             exit 1
           fi
           git check-ref-format "refs/tags/$RELEASE_TAG"
