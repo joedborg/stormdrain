@@ -25,6 +25,22 @@ use crate::{
     types::InfoHash,
 };
 
+const MAX_WRITE_ATTEMPTS: usize = 3;
+
+async fn write_temp_file(path: &Path, contents: &[u8]) -> Result<()> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match fs::write(path, contents).await {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempts < MAX_WRITE_ATTEMPTS => {
+                fs::create_dir_all(path.parent().unwrap()).await?;
+            }
+            Err(e) => return Err(Error::Io(e)),
+        }
+    }
+}
+
 /// Persisted download state used for fast-resume across restarts.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct ResumeState {
@@ -66,17 +82,29 @@ impl ResumeState {
         let json = serde_json::to_string_pretty(self)?;
         // Write to a temp file then rename for atomicity.
         let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, json.as_bytes()).await?;
+        write_temp_file(&tmp, json.as_bytes()).await?;
         fs::rename(&tmp, &path).await?;
         Ok(())
     }
 
-    /// Remove the resume file (called when download completes).
+    /// Remove the resume file and its directory if empty (called when download completes).
     pub async fn remove(download_dir: &Path, info_hash: &InfoHash) -> Result<()> {
         let path = Self::path_for(download_dir, info_hash);
         match fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::Io(e)),
+        }
+        match fs::remove_dir(download_dir.join(".stormdrain")).await {
             Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                Ok(())
+            }
             Err(e) => Err(Error::Io(e)),
         }
     }
@@ -201,6 +229,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_recreates_resume_directory_if_removed_before_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let resume_dir = dir.path().join(".stormdrain");
+        let tmp = resume_dir.join("state.json.tmp");
+        // Simulate save() creating the directory, then a concurrent remove()
+        // deleting it before the temp file is written.
+        fs::create_dir_all(&resume_dir).await.unwrap();
+        ResumeState::remove(dir.path(), &InfoHash([0x04u8; 20]))
+            .await
+            .unwrap();
+        assert!(!resume_dir.exists());
+
+        write_temp_file(&tmp, b"checkpoint").await.unwrap();
+
+        assert_eq!(fs::read(tmp).await.unwrap(), b"checkpoint");
+    }
+
+    #[tokio::test]
     async fn load_returns_empty_when_file_absent() {
         let dir = tempfile::tempdir().unwrap();
         let info_hash = InfoHash([0x00u8; 20]);
@@ -210,7 +256,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_deletes_file() {
+    async fn remove_deletes_file_and_empty_directory() {
         let dir = tempfile::tempdir().unwrap();
         let info_hash = InfoHash([0x01u8; 20]);
 
@@ -230,6 +276,60 @@ mod tests {
 
         ResumeState::remove(dir.path(), &info_hash).await.unwrap();
         assert!(!p.exists());
+        assert!(!dir.path().join(".stormdrain").exists());
+    }
+
+    #[tokio::test]
+    async fn remove_preserves_other_downloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let info_hash = InfoHash([0x01u8; 20]);
+        let other_hash = InfoHash([0x02u8; 20]);
+        for hash in [info_hash, other_hash] {
+            ResumeState {
+                info_hash: hash.to_hex(),
+                pieces_done: vec![0],
+                downloaded: 512,
+                uploaded: 0,
+            }
+            .save(dir.path())
+            .await
+            .unwrap();
+        }
+
+        ResumeState::remove(dir.path(), &info_hash).await.unwrap();
+        assert!(!ResumeState::path_for(dir.path(), &info_hash).exists());
+        let loaded = ResumeState::load(dir.path(), &other_hash).await.unwrap();
+        assert_eq!(loaded.pieces_done, vec![0]);
+        assert_eq!(loaded.downloaded, 512);
+
+        ResumeState::remove(dir.path(), &other_hash).await.unwrap();
+        assert!(!dir.path().join(".stormdrain").exists());
+    }
+
+    #[tokio::test]
+    async fn remove_cleans_empty_directory_when_file_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let resume_dir = dir.path().join(".stormdrain");
+        fs::create_dir(&resume_dir).await.unwrap();
+
+        ResumeState::remove(dir.path(), &InfoHash([0x02u8; 20]))
+            .await
+            .unwrap();
+        assert!(!resume_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_preserves_unrelated_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let resume_dir = dir.path().join(".stormdrain");
+        fs::create_dir(&resume_dir).await.unwrap();
+        let tmp = resume_dir.join("pending.json.tmp");
+        fs::write(&tmp, b"pending checkpoint").await.unwrap();
+
+        ResumeState::remove(dir.path(), &InfoHash([0x02u8; 20]))
+            .await
+            .unwrap();
+        assert_eq!(fs::read(&tmp).await.unwrap(), b"pending checkpoint");
     }
 
     #[tokio::test]

@@ -217,8 +217,10 @@ pub async fn download(
         };
         drop(mgr);
         if let Some(cp) = checkpoint {
-            let _ = cp.save(&config.download_dir).await;
-            last_saved_pieces = pieces_done;
+            match cp.save(&config.download_dir).await {
+                Ok(()) => last_saved_pieces = pieces_done,
+                Err(e) => tracing::debug!("Failed to save resume checkpoint: {e}"),
+            }
         }
 
         let delta = downloaded.saturating_sub(last_downloaded);
@@ -311,7 +313,9 @@ pub async fn download(
     }
 
     // Remove resume state on clean exit.
-    let _ = ResumeState::remove(&config.download_dir, &meta.info_hash).await;
+    if let Err(e) = ResumeState::remove(&config.download_dir, &meta.info_hash).await {
+        tracing::warn!("Failed to remove resume state: {e}");
+    }
 
     Ok(())
 }
