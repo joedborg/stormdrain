@@ -25,11 +25,15 @@ use crate::{
     types::InfoHash,
 };
 
+const MAX_WRITE_ATTEMPTS: usize = 3;
+
 async fn write_temp_file(path: &Path, contents: &[u8]) -> Result<()> {
+    let mut attempts = 0;
     loop {
+        attempts += 1;
         match fs::write(path, contents).await {
             Ok(()) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempts < MAX_WRITE_ATTEMPTS => {
                 fs::create_dir_all(path.parent().unwrap()).await?;
             }
             Err(e) => return Err(Error::Io(e)),
@@ -227,7 +231,15 @@ mod tests {
     #[tokio::test]
     async fn save_recreates_resume_directory_if_removed_before_write() {
         let dir = tempfile::tempdir().unwrap();
-        let tmp = dir.path().join(".stormdrain").join("state.json.tmp");
+        let resume_dir = dir.path().join(".stormdrain");
+        let tmp = resume_dir.join("state.json.tmp");
+        // Simulate save() creating the directory, then a concurrent remove()
+        // deleting it before the temp file is written.
+        fs::create_dir_all(&resume_dir).await.unwrap();
+        ResumeState::remove(dir.path(), &InfoHash([0x04u8; 20]))
+            .await
+            .unwrap();
+        assert!(!resume_dir.exists());
 
         write_temp_file(&tmp, b"checkpoint").await.unwrap();
 

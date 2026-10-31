@@ -217,8 +217,10 @@ pub async fn download(
         };
         drop(mgr);
         if let Some(cp) = checkpoint {
-            let _ = cp.save(&config.download_dir).await;
-            last_saved_pieces = pieces_done;
+            match cp.save(&config.download_dir).await {
+                Ok(()) => last_saved_pieces = pieces_done,
+                Err(e) => tracing::debug!("Failed to save resume checkpoint: {e}"),
+            }
         }
 
         let delta = downloaded.saturating_sub(last_downloaded);
