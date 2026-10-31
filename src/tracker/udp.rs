@@ -31,10 +31,15 @@ const ACTION_ANNOUNCE: u32 = 1;
 /// respond within the timeout, or the response is malformed.
 pub async fn announce(req: &AnnounceRequest<'_>, url: &str) -> Result<AnnounceResponse> {
     // Parse udp://host:port/...
-    let addr = parse_udp_addr(url)?;
+    let addr = parse_udp_addr(url).await?;
     tracing::debug!("UDP announce → {addr}");
 
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let bind_addr = if addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(bind_addr).await?;
     socket.connect(&addr).await?;
 
     // Step 1: connect
@@ -124,7 +129,7 @@ pub async fn announce(req: &AnnounceRequest<'_>, url: &str) -> Result<AnnounceRe
 
     let interval = u32_be(&rbuf, 8) as u64;
     // Leechers @ 12, seeders @ 16 — unused for now
-    let peers = parse_compact_peers(&rbuf[20..n]);
+    let peers = parse_compact_peers(&rbuf[20..n], addr.is_ipv6());
 
     Ok(AnnounceResponse {
         peers,
@@ -133,31 +138,58 @@ pub async fn announce(req: &AnnounceRequest<'_>, url: &str) -> Result<AnnounceRe
     })
 }
 
-fn parse_compact_peers(data: &[u8]) -> Vec<PeerAddr> {
-    use std::net::{IpAddr, Ipv4Addr};
+fn parse_compact_peers(data: &[u8], ipv6: bool) -> Vec<PeerAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     let mut out = Vec::new();
-    for chunk in data.chunks_exact(6) {
-        let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
-        let port = u16::from_be_bytes([chunk[4], chunk[5]]);
-        out.push(PeerAddr {
-            ip: IpAddr::V4(ip),
-            port,
-        });
+    let ip_len = if ipv6 { 16 } else { 4 };
+    for chunk in data.chunks_exact(ip_len + 2) {
+        let ip = if ipv6 {
+            IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&chunk[..16]).unwrap()))
+        } else {
+            IpAddr::V4(Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]))
+        };
+        let port = u16::from_be_bytes([chunk[ip_len], chunk[ip_len + 1]]);
+        out.push(PeerAddr { ip, port });
     }
     out
 }
 
-fn parse_udp_addr(url: &str) -> Result<SocketAddr> {
-    // Strip scheme: udp:// or UDP://
-    let rest = url
-        .strip_prefix("udp://")
-        .or_else(|| url.strip_prefix("UDP://"))
-        .ok_or_else(|| Error::Tracker(format!("not a UDP tracker URL: {url}")))?;
-    // Drop any /announce path component
-    let host_port = rest.split('/').next().unwrap_or(rest);
-    host_port
-        .parse::<SocketAddr>()
-        .map_err(|e| Error::Tracker(format!("invalid UDP tracker address '{host_port}': {e}")))
+async fn parse_udp_addr(tracker_url: &str) -> Result<SocketAddr> {
+    let url = url::Url::parse(tracker_url)
+        .map_err(|e| Error::Tracker(format!("invalid UDP tracker URL '{tracker_url}': {e}")))?;
+    if url.scheme() != "udp" {
+        return Err(Error::Tracker(format!(
+            "not a UDP tracker URL: {tracker_url}"
+        )));
+    }
+    let port = url
+        .port()
+        .filter(|&port| port != 0)
+        .ok_or_else(|| Error::Tracker("UDP tracker URL must have a nonzero port".into()))?;
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => Ok(SocketAddr::new(ip.into(), port)),
+        Some(url::Host::Ipv6(ip)) => Ok(SocketAddr::new(ip.into(), port)),
+        Some(url::Host::Domain(host)) => {
+            let addrs: Vec<_> = timeout(
+                Duration::from_secs(15),
+                tokio::net::lookup_host((host, port)),
+            )
+            .await
+            .map_err(|_| Error::Tracker(format!("DNS lookup timed out for '{host}'")))?
+            .map_err(|e| Error::Tracker(format!("DNS lookup failed for '{host}': {e}")))?
+            .collect();
+            // Prefer IPv4, but support trackers that only resolve to IPv6.
+            addrs
+                .iter()
+                .find(|addr| addr.is_ipv4())
+                .or_else(|| addrs.first())
+                .copied()
+                .ok_or_else(|| {
+                    Error::Tracker(format!("DNS lookup returned no addresses for '{host}'"))
+                })
+        }
+        None => Err(Error::Tracker("UDP tracker URL must have a host".into())),
+    }
 }
 
 async fn recv_timeout(socket: &UdpSocket, buf: &mut [u8], dur: Duration) -> Result<usize> {
@@ -169,4 +201,56 @@ async fn recv_timeout(socket: &UdpSocket, buf: &mut [u8], dur: Duration) -> Resu
 
 fn u32_be(buf: &[u8], offset: usize) -> u32 {
     u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_compact_peers_for_tracker_address_family() {
+        let ipv4 = parse_compact_peers(&[127, 0, 0, 1, 0x1a, 0xe1], false);
+        assert_eq!(SocketAddr::from(ipv4[0]), "127.0.0.1:6881".parse().unwrap());
+
+        let mut data = std::net::Ipv6Addr::LOCALHOST.octets().to_vec();
+        data.extend_from_slice(&6881u16.to_be_bytes());
+        let ipv6 = parse_compact_peers(&data, true);
+        assert_eq!(SocketAddr::from(ipv6[0]), "[::1]:6881".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn resolves_hostname_with_and_without_announce_path() {
+        for url in ["udp://localhost:1337", "udp://localhost:1337/announce"] {
+            let addr = parse_udp_addr(url).await.unwrap();
+            assert!(addr.ip().is_loopback());
+            assert_eq!(addr.port(), 1337);
+        }
+    }
+
+    #[tokio::test]
+    async fn parses_ip_literals_and_uppercase_scheme() {
+        assert_eq!(
+            parse_udp_addr("UDP://127.0.0.1:6969/announce")
+                .await
+                .unwrap(),
+            "127.0.0.1:6969".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            parse_udp_addr("udp://[::1]:6969/announce").await.unwrap(),
+            "[::1]:6969".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_tracker_urls() {
+        for url in [
+            "http://localhost:1337/announce",
+            "udp://localhost/announce",
+            "udp://localhost:0/announce",
+            "udp://localhost:invalid/announce",
+            "udp:///announce",
+        ] {
+            assert!(matches!(parse_udp_addr(url).await, Err(Error::Tracker(_))));
+        }
+    }
 }

@@ -648,7 +648,11 @@ async fn fetch_magnet_metadata(placeholder: &Metainfo, config: &Config) -> Resul
         match metadata_exchange::fetch_from_peer(peer, &placeholder.info_hash, &config.peer_id)
             .await
         {
-            Ok(meta) => return Ok(meta),
+            Ok(mut meta) => {
+                // BEP-9 transfers only the info dict, not the tracker URLs.
+                meta.trackers = placeholder.trackers.clone();
+                return Ok(meta);
+            }
             Err(e) => tracing::debug!("BEP-9 from {peer}: {e}"),
         }
     }
@@ -792,4 +796,148 @@ async fn serve_peer(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use tokio::{io::AsyncReadExt, net::UdpSocket};
+
+    #[tokio::test]
+    async fn downloads_magnet_using_hostname_tracker_after_metadata_exchange() {
+        timeout(Duration::from_secs(5), async {
+            let content = b"test";
+            let mut info = b"d6:lengthi4e4:name8:test.txt12:piece lengthi4e6:pieces20:".to_vec();
+            info.extend_from_slice(&Sha1::digest(content));
+            info.push(b'e');
+            let info_hash = InfoHash(Sha1::digest(&info).into());
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let peer_addr = listener.local_addr().unwrap();
+            let tracker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let tracker_url = format!(
+                "udp://localhost:{}/announce",
+                tracker.local_addr().unwrap().port()
+            );
+
+            let tracker_task = tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                for left in [0u64, 4, 0] {
+                    let (n, client) = tracker.recv_from(&mut buf).await.unwrap();
+                    assert_eq!(n, 16);
+                    assert_eq!(&buf[..8], &0x0000041727101980u64.to_be_bytes());
+                    let mut response = buf[8..16].to_vec();
+                    response.extend_from_slice(&1u64.to_be_bytes());
+                    tracker.send_to(&response, client).await.unwrap();
+
+                    let (n, client) = tracker.recv_from(&mut buf).await.unwrap();
+                    assert_eq!(n, 98);
+                    assert_eq!(&buf[16..36], info_hash.as_bytes());
+                    assert_eq!(&buf[64..72], &left.to_be_bytes());
+                    let mut response = buf[8..16].to_vec();
+                    response.extend_from_slice(&1800u32.to_be_bytes());
+                    response.extend_from_slice(&0u32.to_be_bytes());
+                    response.extend_from_slice(&1u32.to_be_bytes());
+                    response.extend_from_slice(&[127, 0, 0, 1]);
+                    response.extend_from_slice(&peer_addr.port().to_be_bytes());
+                    tracker.send_to(&response, client).await.unwrap();
+                }
+            });
+
+            let peer_task = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                handshake::perform(&mut stream, info_hash, PeerId([7; 20]))
+                    .await
+                    .unwrap();
+                let mut conn = PeerConn::new(stream);
+                assert!(matches!(
+                    conn.read_message().await.unwrap(),
+                    Some(Message::Extension { ext_id: 0, .. })
+                ));
+                conn.send(&Message::Extension {
+                    ext_id: 0,
+                    payload: Bytes::from(format!(
+                        "d1:md11:ut_metadatai42ee13:metadata_sizei{}ee",
+                        info.len()
+                    )),
+                })
+                .await
+                .unwrap();
+                let Some(Message::Extension { ext_id, payload }) =
+                    conn.read_message().await.unwrap()
+                else {
+                    panic!("expected metadata request");
+                };
+                assert_eq!(ext_id, 42);
+                assert_eq!(&payload[..], b"d8:msg_typei0e5:piecei0ee");
+                let mut payload =
+                    format!("d8:msg_typei1e5:piecei0e10:total_sizei{}ee", info.len()).into_bytes();
+                payload.extend_from_slice(&info);
+                conn.send(&Message::Extension {
+                    ext_id: 1,
+                    payload: Bytes::from(payload),
+                })
+                .await
+                .unwrap();
+                drop(conn);
+
+                // Reject MSE so the downloader reconnects using plaintext.
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream.read_exact(&mut [0u8; 96]).await.unwrap();
+                drop(stream);
+                let (mut stream, _) = listener.accept().await.unwrap();
+                handshake::perform(&mut stream, info_hash, PeerId([7; 20]))
+                    .await
+                    .unwrap();
+                let mut conn = PeerConn::new(stream);
+                conn.send(&Message::Bitfield(vec![0x80])).await.unwrap();
+                conn.send(&Message::Unchoke).await.unwrap();
+                assert!(matches!(
+                    conn.read_message().await.unwrap(),
+                    Some(Message::Interested)
+                ));
+                assert!(matches!(
+                    conn.read_message().await.unwrap(),
+                    Some(Message::Request {
+                        index: 0,
+                        begin: 0,
+                        length: 4
+                    })
+                ));
+                conn.send(&Message::Piece {
+                    index: 0,
+                    begin: 0,
+                    data: Bytes::from_static(content),
+                })
+                .await
+                .unwrap();
+            });
+
+            let encoded_tracker: String =
+                url::form_urlencoded::byte_serialize(tracker_url.as_bytes()).collect();
+            let source = format!(
+                "magnet:?xt=urn:btih:{}&dn=Test%20Download&tr={encoded_tracker}",
+                info_hash.to_hex().to_uppercase()
+            );
+            let (placeholder, _) = crate::resolve_source(&source).await.unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let config = Config {
+                download_dir: dir.path().to_owned(),
+                ..Config::default()
+            };
+            download(Arc::new(placeholder), config, |stats| {
+                assert_eq!(stats.total, 4);
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                tokio::fs::read(dir.path().join("test.txt")).await.unwrap(),
+                content
+            );
+            tracker_task.await.unwrap();
+            peer_task.await.unwrap();
+        })
+        .await
+        .expect("local magnet download timed out");
+    }
 }
