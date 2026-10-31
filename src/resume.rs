@@ -25,6 +25,18 @@ use crate::{
     types::InfoHash,
 };
 
+async fn write_temp_file(path: &Path, contents: &[u8]) -> Result<()> {
+    loop {
+        match fs::write(path, contents).await {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(path.parent().unwrap()).await?;
+            }
+            Err(e) => return Err(Error::Io(e)),
+        }
+    }
+}
+
 /// Persisted download state used for fast-resume across restarts.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct ResumeState {
@@ -66,7 +78,7 @@ impl ResumeState {
         let json = serde_json::to_string_pretty(self)?;
         // Write to a temp file then rename for atomicity.
         let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, json.as_bytes()).await?;
+        write_temp_file(&tmp, json.as_bytes()).await?;
         fs::rename(&tmp, &path).await?;
         Ok(())
     }
@@ -210,6 +222,16 @@ mod tests {
         assert_eq!(loaded.info_hash, state.info_hash);
         assert_eq!(loaded.pieces_done, vec![0, 1, 3]);
         assert_eq!(loaded.downloaded, 98304);
+    }
+
+    #[tokio::test]
+    async fn save_recreates_resume_directory_if_removed_before_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join(".stormdrain").join("state.json.tmp");
+
+        write_temp_file(&tmp, b"checkpoint").await.unwrap();
+
+        assert_eq!(fs::read(tmp).await.unwrap(), b"checkpoint");
     }
 
     #[tokio::test]
