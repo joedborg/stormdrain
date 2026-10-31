@@ -311,7 +311,9 @@ pub async fn download(
     }
 
     // Remove resume state on clean exit.
-    let _ = ResumeState::remove(&config.download_dir, &meta.info_hash).await;
+    if let Err(e) = ResumeState::remove(&config.download_dir, &meta.info_hash).await {
+        tracing::warn!("Failed to remove resume state: {e}");
+    }
 
     Ok(())
 }
