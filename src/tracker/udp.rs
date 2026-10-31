@@ -52,25 +52,8 @@ pub async fn announce(req: &AnnounceRequest<'_>, url: &str) -> Result<AnnounceRe
     socket.send(&connect_req).await?;
 
     let mut buf = [0u8; 1024];
-    let n = recv_timeout(&socket, &mut buf, Duration::from_secs(15))
-        .await
-        .map_err(|_| Error::Tracker("UDP connect timeout".into()))?;
-
-    if n < 16 {
-        return Err(Error::Tracker("UDP connect response too short".into()));
-    }
-    let resp_action = u32_be(&buf, 0);
-    let resp_txid = u32_be(&buf, 4);
-    if resp_action != ACTION_CONNECT {
-        return Err(Error::Tracker(format!(
-            "UDP connect: unexpected action {resp_action}"
-        )));
-    }
-    if resp_txid != transaction_id {
-        return Err(Error::Tracker(
-            "UDP connect: transaction ID mismatch".into(),
-        ));
-    }
+    let n = recv_timeout(&socket, &mut buf, Duration::from_secs(15), "connect").await?;
+    validate_response(&buf[..n], ACTION_CONNECT, transaction_id)?;
     let connection_id = u64::from_be_bytes(buf[8..16].try_into().unwrap());
 
     // Step 2: announce
@@ -99,33 +82,8 @@ pub async fn announce(req: &AnnounceRequest<'_>, url: &str) -> Result<AnnounceRe
     socket.send(&ann).await?;
 
     let mut rbuf = [0u8; 65536];
-    let n = recv_timeout(&socket, &mut rbuf, Duration::from_secs(15))
-        .await
-        .map_err(|_| Error::Tracker("UDP announce timeout".into()))?;
-
-    if n < 20 {
-        return Err(Error::Tracker(format!(
-            "UDP announce response too short: {n}"
-        )));
-    }
-    let resp_action = u32_be(&rbuf, 0);
-    let resp_txid = u32_be(&rbuf, 4);
-
-    if resp_action == 3 {
-        // Error response
-        let msg = std::str::from_utf8(&rbuf[8..n]).unwrap_or("unknown error");
-        return Err(Error::Tracker(format!("UDP tracker error: {msg}")));
-    }
-    if resp_action != ACTION_ANNOUNCE {
-        return Err(Error::Tracker(format!(
-            "UDP announce: unexpected action {resp_action}"
-        )));
-    }
-    if resp_txid != transaction_id2 {
-        return Err(Error::Tracker(
-            "UDP announce: transaction ID mismatch".into(),
-        ));
-    }
+    let n = recv_timeout(&socket, &mut rbuf, Duration::from_secs(15), "announce").await?;
+    validate_response(&rbuf[..n], ACTION_ANNOUNCE, transaction_id2)?;
 
     let interval = u32_be(&rbuf, 8) as u64;
     // Leechers @ 12, seeders @ 16 — unused for now
@@ -192,10 +150,52 @@ async fn parse_udp_addr(tracker_url: &str) -> Result<SocketAddr> {
     }
 }
 
-async fn recv_timeout(socket: &UdpSocket, buf: &mut [u8], dur: Duration) -> Result<usize> {
+fn validate_response(data: &[u8], action: u32, transaction_id: u32) -> Result<()> {
+    let stage = if action == ACTION_CONNECT {
+        "connect"
+    } else {
+        "announce"
+    };
+    if data.len() < 8 {
+        return Err(Error::Tracker(format!(
+            "UDP {stage} response too short: {}",
+            data.len()
+        )));
+    }
+    if u32_be(data, 4) != transaction_id {
+        return Err(Error::Tracker(format!(
+            "UDP {stage}: transaction ID mismatch"
+        )));
+    }
+    let response_action = u32_be(data, 0);
+    if response_action == 3 {
+        let message = String::from_utf8_lossy(&data[8..]);
+        return Err(Error::Tracker(format!("UDP tracker error: {message}")));
+    }
+    if response_action != action {
+        return Err(Error::Tracker(format!(
+            "UDP {stage}: unexpected action {response_action}"
+        )));
+    }
+    let minimum = if action == ACTION_CONNECT { 16 } else { 20 };
+    if data.len() < minimum {
+        return Err(Error::Tracker(format!(
+            "UDP {stage} response too short: {}",
+            data.len()
+        )));
+    }
+    Ok(())
+}
+
+async fn recv_timeout(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+    dur: Duration,
+    stage: &str,
+) -> Result<usize> {
     timeout(dur, socket.recv(buf))
         .await
-        .map_err(|_| Error::Tracker("timeout".into()))?
+        .map_err(|_| Error::Tracker(format!("UDP {stage} timeout")))?
         .map_err(Error::Io)
 }
 
@@ -206,6 +206,46 @@ fn u32_be(buf: &[u8], offset: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_short_tracker_error_responses_for_both_stages() {
+        let mut response = 3u32.to_be_bytes().to_vec();
+        response.extend_from_slice(&42u32.to_be_bytes());
+        response.extend_from_slice(b"denied");
+        for action in [ACTION_CONNECT, ACTION_ANNOUNCE] {
+            assert!(matches!(
+                validate_response(&response, action, 42),
+                Err(Error::Tracker(message)) if message == "UDP tracker error: denied"
+            ));
+            assert!(matches!(
+                validate_response(&response, action, 43),
+                Err(Error::Tracker(message)) if message.contains("transaction ID mismatch")
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_udp_responses_without_panicking() {
+        for action in [ACTION_CONNECT, ACTION_ANNOUNCE] {
+            let mut response = action.to_be_bytes().to_vec();
+            response.extend_from_slice(&42u32.to_be_bytes());
+            for len in 0..=response.len() {
+                assert!(matches!(
+                    validate_response(&response[..len], action, 42),
+                    Err(Error::Tracker(message)) if message.contains("too short")
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_timeout_identifies_the_protocol_stage() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert!(matches!(
+            recv_timeout(&socket, &mut [0u8; 1024], Duration::from_millis(10), "connect").await,
+            Err(Error::Tracker(message)) if message == "UDP connect timeout"
+        ));
+    }
 
     #[test]
     fn parses_compact_peers_for_tracker_address_family() {

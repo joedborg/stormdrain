@@ -570,43 +570,61 @@ async fn announce_all(
 ) -> (Vec<PeerAddr>, bool) {
     let mut all_peers = Vec::new();
     let mut any_responded = false;
+    let mut announces = JoinSet::new();
+    let info_hash = meta.info_hash;
+    let peer_id = config.peer_id;
+    let port = config.listen_port;
+    let left = meta.total_length.saturating_sub(downloaded);
+    // Independent tiers run concurrently; fallback within a tier stays ordered.
     for tier in &meta.trackers {
-        for url in tier {
-            let req = AnnounceRequest {
-                tracker_url: url,
-                info_hash: meta.info_hash,
-                peer_id: config.peer_id,
-                port: config.listen_port,
-                uploaded,
-                downloaded,
-                left: meta.total_length.saturating_sub(downloaded),
-                event: Some(event),
-                num_want: 200,
-            };
-            let result = if url.starts_with("udp://") || url.starts_with("UDP://") {
-                tracker::udp::announce(&req, url).await
-            } else if url.starts_with("http://") || url.starts_with("https://") {
-                tracker::announce(&req).await
-            } else {
-                tracing::debug!("Skipping unsupported tracker scheme: {url}");
-                continue;
-            };
-            match result {
-                Ok(resp) => {
-                    any_responded = true;
-                    if let Some(w) = &resp.warning {
-                        tracing::warn!("Tracker {url}: warning: {w}");
+        let tier = tier.clone();
+        announces.spawn(async move {
+            for url in &tier {
+                let req = AnnounceRequest {
+                    tracker_url: url,
+                    info_hash,
+                    peer_id,
+                    port,
+                    uploaded,
+                    downloaded,
+                    left,
+                    event: Some(event),
+                    num_want: 200,
+                };
+                let result = if url.starts_with("udp://") || url.starts_with("UDP://") {
+                    tracker::udp::announce(&req, url).await
+                } else if url.starts_with("http://") || url.starts_with("https://") {
+                    tracker::announce(&req).await
+                } else {
+                    tracing::debug!("Skipping unsupported tracker scheme: {url}");
+                    continue;
+                };
+                match result {
+                    Ok(resp) => {
+                        if let Some(w) = &resp.warning {
+                            tracing::warn!("Tracker {url}: warning: {w}");
+                        }
+                        if resp.peers.is_empty() {
+                            tracing::warn!("Tracker {url}: responded with 0 peers");
+                        } else {
+                            tracing::info!("Tracker {}: {} peers", url, resp.peers.len());
+                        }
+                        return Some(resp.peers); // BEP-12: first responsive tracker in tier
                     }
-                    if resp.peers.is_empty() {
-                        tracing::warn!("Tracker {url}: responded with 0 peers");
-                    } else {
-                        tracing::info!("Tracker {}: {} peers", url, resp.peers.len());
-                    }
-                    all_peers.extend(resp.peers);
-                    break; // BEP-12: use first responsive tracker in tier
+                    Err(e) => tracing::warn!("Tracker {url}: {e}"),
                 }
-                Err(e) => tracing::warn!("Tracker {url}: {e}"),
             }
+            None
+        });
+    }
+    while let Some(result) = announces.join_next().await {
+        match result {
+            Ok(Some(peers)) => {
+                any_responded = true;
+                all_peers.extend(peers);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("Tracker announce task failed: {e}"),
         }
     }
 
@@ -803,6 +821,102 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use tokio::{io::AsyncReadExt, net::UdpSocket};
+
+    #[tokio::test]
+    async fn announces_independent_tracker_tiers_concurrently() {
+        timeout(Duration::from_secs(5), async {
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let mut trackers = Vec::new();
+            let mut servers = JoinSet::new();
+            for _ in 0..2 {
+                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                trackers.push(vec![format!("udp://{}", socket.local_addr().unwrap())]);
+                let barrier = barrier.clone();
+                servers.spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let (_, client) = socket.recv_from(&mut buf).await.unwrap();
+                    // Neither tracker responds until both tiers have been contacted.
+                    barrier.wait().await;
+                    let mut response = buf[8..16].to_vec();
+                    response.extend_from_slice(&1u64.to_be_bytes());
+                    socket.send_to(&response, client).await.unwrap();
+                    let (_, client) = socket.recv_from(&mut buf).await.unwrap();
+                    let mut response = buf[8..16].to_vec();
+                    response.extend_from_slice(&1800u32.to_be_bytes());
+                    response.extend_from_slice(&0u64.to_be_bytes());
+                    response.extend_from_slice(&[127, 0, 0, 1, 0x1a, 0xe1]);
+                    socket.send_to(&response, client).await.unwrap();
+                });
+            }
+            let mut meta = Metainfo::placeholder_magnet(&crate::magnet::MagnetLink {
+                info_hash: InfoHash([1; 20]),
+                name: None,
+                trackers: Vec::new(),
+            });
+            meta.trackers = trackers;
+            let (peers, responded) =
+                announce_all(&meta, &Config::default(), Event::Started, 0, 0).await;
+            assert!(responded);
+            assert_eq!(peers.len(), 1);
+            assert_eq!(
+                SocketAddr::from(peers[0]),
+                "127.0.0.1:6881".parse().unwrap()
+            );
+            while let Some(result) = servers.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .expect("tracker tiers were not contacted concurrently");
+    }
+
+    #[tokio::test]
+    async fn falls_back_within_tier_and_stops_at_first_responsive_tracker() {
+        timeout(Duration::from_secs(5), async {
+            let rejected = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let responsive = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let unused = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut meta = Metainfo::placeholder_magnet(&crate::magnet::MagnetLink {
+                info_hash: InfoHash([1; 20]),
+                name: None,
+                trackers: Vec::new(),
+            });
+            meta.trackers = vec![vec![
+                format!("udp://{}", rejected.local_addr().unwrap()),
+                format!("udp://{}", responsive.local_addr().unwrap()),
+                format!("udp://{}", unused.local_addr().unwrap()),
+            ]];
+            let server = tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let (_, client) = rejected.recv_from(&mut buf).await.unwrap();
+                let mut response = 3u32.to_be_bytes().to_vec();
+                response.extend_from_slice(&buf[12..16]);
+                response.extend_from_slice(b"denied");
+                rejected.send_to(&response, client).await.unwrap();
+                let (_, client) = responsive.recv_from(&mut buf).await.unwrap();
+                let mut response = buf[8..16].to_vec();
+                response.extend_from_slice(&1u64.to_be_bytes());
+                responsive.send_to(&response, client).await.unwrap();
+                let (_, client) = responsive.recv_from(&mut buf).await.unwrap();
+                let mut response = buf[8..16].to_vec();
+                response.extend_from_slice(&1800u32.to_be_bytes());
+                response.extend_from_slice(&0u64.to_be_bytes());
+                responsive.send_to(&response, client).await.unwrap();
+            });
+            // A responsive tracker with zero peers still ends tier fallback.
+            let (peers, responded) =
+                announce_all(&meta, &Config::default(), Event::Completed, 0, 0).await;
+            assert!(responded);
+            assert!(peers.is_empty());
+            assert!(matches!(
+                unused.try_recv_from(&mut [0u8; 1024]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+            ));
+            server.await.unwrap();
+        })
+        .await
+        .expect("tracker tier fallback timed out");
+    }
 
     #[tokio::test]
     async fn downloads_magnet_using_hostname_tracker_after_metadata_exchange() {

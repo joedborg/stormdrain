@@ -51,7 +51,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         eprint!("Resolving {}…", args.source);
     }
 
-    let (meta, _magnet) = resolve_source(&args.source)
+    let (meta, magnet) = resolve_source(&args.source)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -60,12 +60,16 @@ async fn run(args: Args) -> anyhow::Result<()> {
     if !args.quiet {
         eprintln!(" done");
         eprintln!("  Name:        {}", meta.name);
-        eprintln!("  Size:        {}", human_size(meta.total_length));
-        eprintln!(
-            "  Pieces:      {} × {}",
-            meta.piece_count(),
-            human_size(meta.piece_length)
-        );
+        if magnet.is_some() {
+            eprintln!("  Metadata:    fetching from peers...");
+        } else {
+            eprintln!("  Size:        {}", human_size(meta.total_length));
+            eprintln!(
+                "  Pieces:      {} × {}",
+                meta.piece_count(),
+                human_size(meta.piece_length)
+            );
+        }
         eprintln!("  Info hash:   {}", meta.info_hash);
         if let Some(ref by) = meta.created_by {
             eprintln!("  Created by:  {by}");
@@ -100,6 +104,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let pb_cb = pb_arc.clone();
     let on_progress = move |stats: DownloadStats| {
         if let Some(ref pb) = pb_cb {
+            pb.set_length(stats.total);
             pb.set_position(stats.downloaded);
             pb.set_message(format!("{} peer(s)", stats.peers_active));
         } else if !quiet {
