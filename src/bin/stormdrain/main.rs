@@ -92,6 +92,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         peer_id: peer_id::generate(),
         pipeline: 5,
         max_peers: 50,
+        idle_timeout: args.idle_timeout.map(std::time::Duration::from_secs),
         seed: args.seed,
         seed_ratio: args.seed_ratio,
         seed_time: args
@@ -106,7 +107,14 @@ async fn run(args: Args) -> anyhow::Result<()> {
         if let Some(ref pb) = pb_cb {
             pb.set_length(stats.total);
             pb.set_position(stats.downloaded);
-            pb.set_message(format!("{} peer(s)", stats.peers_active));
+            let message = if stats.total == 0 {
+                format!("fetching metadata; {} peer(s)", stats.peers_active)
+            } else if stats.state == download::DownloadState::Connecting {
+                "waiting for peers; retrying discovery".to_owned()
+            } else {
+                format!("{} peer(s)", stats.peers_active)
+            };
+            pb.set_message(message);
         } else if !quiet {
             eprint!(
                 "\rProgress: {:.1}%  {:.1} KB/s  {} peers{:20}",

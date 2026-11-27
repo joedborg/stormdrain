@@ -16,7 +16,7 @@ use std::{
 use rand::prelude::*;
 use tokio::{
     net::UdpSocket,
-    sync::{Mutex, mpsc},
+    sync::{Mutex, Notify, mpsc},
 };
 
 use crate::{
@@ -124,6 +124,15 @@ impl RoutingTable {
 #[derive(Clone)]
 pub struct Dht {
     inner: Arc<DhtInner>,
+    receiver: Option<Arc<ReceiveTask>>,
+}
+
+struct ReceiveTask(tokio::task::JoinHandle<()>);
+
+impl Drop for ReceiveTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 struct DhtInner {
@@ -131,6 +140,7 @@ struct DhtInner {
     own_id: NodeId,
     table: Mutex<RoutingTable>,
     pending: Mutex<HashMap<[u8; 2], PendingQuery>>,
+    ready: Notify,
 }
 
 struct PendingQuery {
@@ -148,27 +158,44 @@ impl Dht {
     /// Start the DHT, bootstrap, and return a handle.
     pub async fn start() -> Result<Self> {
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let dht = Self::from_socket(socket);
+        dht.bootstrap().await;
+        Ok(dht)
+    }
+
+    fn from_socket(socket: UdpSocket) -> Self {
         let own_id = NodeId::random();
-        let dht = Dht {
+        let mut dht = Dht {
             inner: Arc::new(DhtInner {
                 socket,
                 own_id,
                 table: Mutex::new(RoutingTable::new()),
                 pending: Mutex::new(HashMap::new()),
+                ready: Notify::new(),
             }),
+            receiver: None,
         };
-        // Spawn background receive loop.
+        // The receive loop must not own the guard that cancels it when the
+        // last public handle is dropped.
         let dht2 = dht.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             dht2.recv_loop().await;
         });
-        // Bootstrap.
-        dht.bootstrap().await;
-        Ok(dht)
+        dht.receiver = Some(Arc::new(ReceiveTask(task)));
+        dht
     }
 
     /// Look up peers for `info_hash`. Returns up to `max` peers.
     pub async fn get_peers(&self, info_hash: InfoHash, max: usize) -> Vec<PeerAddr> {
+        if self.inner.table.lock().await.is_empty() {
+            self.bootstrap().await;
+            if tokio::time::timeout(Duration::from_secs(5), self.inner.ready.notified())
+                .await
+                .is_err()
+            {
+                tracing::debug!("DHT bootstrap has not returned any nodes yet");
+            }
+        }
         let target = NodeId(info_hash.0);
         let seed_nodes = self.inner.table.lock().await.closest(&target, K);
 
@@ -227,10 +254,16 @@ impl Dht {
     // Internals
     async fn bootstrap(&self) {
         for addr_str in BOOTSTRAP_NODES {
-            if let Ok(addrs) = tokio::net::lookup_host(*addr_str).await {
-                for addr in addrs {
-                    self.send_find_node(&addr, &self.inner.own_id).await;
+            match tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(*addr_str))
+                .await
+            {
+                Ok(Ok(addrs)) => {
+                    for addr in addrs.filter(SocketAddr::is_ipv4) {
+                        self.send_find_node(&addr, &self.inner.own_id).await;
+                    }
                 }
+                Ok(Err(e)) => tracing::debug!("DHT bootstrap DNS for {addr_str}: {e}"),
+                Err(_) => tracing::debug!("DHT bootstrap DNS timeout for {addr_str}"),
             }
         }
     }
@@ -288,6 +321,7 @@ impl Dht {
                     addr: from,
                     last_seen: Instant::now(),
                 });
+                self.inner.ready.notify_one();
             }
         }
 
@@ -601,5 +635,21 @@ mod tests {
             // Each bootstrap node should contain a port separator.
             assert!(node.contains(':'), "Bootstrap node '{node}' has no port");
         }
+    }
+
+    #[tokio::test]
+    async fn dropping_last_handle_stops_receiver_and_releases_socket() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let dht = Dht::from_socket(socket);
+        let weak = Arc::downgrade(&dht.inner);
+        let clone = dht.clone();
+        drop(dht);
+        tokio::task::yield_now().await;
+        assert!(weak.upgrade().is_some());
+        drop(clone);
+        tokio::task::yield_now().await;
+        assert!(weak.upgrade().is_none());
+        UdpSocket::bind(addr).await.unwrap();
     }
 }

@@ -17,7 +17,7 @@
 
 use bytes::Bytes;
 use sha1::{Digest as _, Sha1};
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, Instant, timeout, timeout_at};
 
 use crate::{
     bencode,
@@ -38,6 +38,19 @@ pub async fn fetch_from_peer(
     info_hash: &InfoHash,
     peer_id: &PeerId,
 ) -> Result<Metainfo> {
+    timeout(
+        Duration::from_secs(90),
+        fetch_from_peer_inner(addr, info_hash, peer_id),
+    )
+    .await
+    .map_err(|_| Error::Peer("metadata exchange exceeded 90 seconds".into()))?
+}
+
+async fn fetch_from_peer_inner(
+    addr: &PeerAddr,
+    info_hash: &InfoHash,
+    peer_id: &PeerId,
+) -> Result<Metainfo> {
     use tokio::net::TcpStream;
 
     let socket_addr = std::net::SocketAddr::new(addr.ip, addr.port);
@@ -46,7 +59,12 @@ pub async fn fetch_from_peer(
         .map_err(|_| Error::Peer("connect timeout".into()))??;
 
     // BEP-3 handshake (with BEP-10 extension bit set).
-    let hs = handshake::perform(&mut stream, *info_hash, *peer_id).await?;
+    let hs = timeout(
+        Duration::from_secs(10),
+        handshake::perform(&mut stream, *info_hash, *peer_id),
+    )
+    .await
+    .map_err(|_| Error::Peer("BitTorrent handshake timeout".into()))??;
 
     if !hs.capabilities.extension_protocol {
         return Err(Error::Peer(
@@ -69,8 +87,9 @@ pub async fn fetch_from_peer(
     // Wait for the peer's extension handshake.
     let peer_ut_metadata_id;
     let metadata_size;
+    let handshake_deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let msg = timeout(Duration::from_secs(15), conn.read_message())
+        let msg = timeout_at(handshake_deadline, conn.read_message())
             .await
             .map_err(|_| Error::Peer("extension handshake timeout".into()))??;
         match msg {
@@ -82,6 +101,11 @@ pub async fn fetch_from_peer(
                 peer_ut_metadata_id = ut_id;
                 metadata_size = size;
                 break;
+            }
+            None => {
+                return Err(Error::Peer(
+                    "peer disconnected before extension handshake".into(),
+                ));
             }
             // Ignore non-extension messages while waiting for handshake.
             _ => {}
@@ -123,10 +147,12 @@ pub async fn fetch_from_peer(
             .await
             .map_err(|_| Error::Peer("metadata exchange timeout".into()))??;
 
-        if let Some(Message::Extension {
+        let msg =
+            msg.ok_or_else(|| Error::Peer("peer disconnected during metadata exchange".into()))?;
+        if let Message::Extension {
             ext_id,
             ref payload,
-        }) = msg
+        } = msg
         {
             if ext_id == UT_METADATA_EXT_ID {
                 if let Some((piece_idx, data)) = parse_metadata_piece(payload, metadata_size)? {
@@ -255,5 +281,89 @@ fn find_bencode_end(data: &[u8]) -> Result<usize> {
             Ok(colon + 1 + len)
         }
         _ => Err(Error::Bencode("unexpected byte in bencode".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::{net::TcpListener, sync::oneshot};
+
+    fn peer_addr(listener: &TcpListener) -> PeerAddr {
+        let addr = listener.local_addr().unwrap();
+        PeerAddr {
+            ip: addr.ip(),
+            port: addr.port(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_disconnects_at_both_metadata_stages() {
+        for after_extension_handshake in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = peer_addr(&listener);
+            let info_hash = InfoHash([1; 20]);
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                handshake::perform(&mut stream, info_hash, PeerId([2; 20]))
+                    .await
+                    .unwrap();
+                let mut conn = PeerConn::new(stream);
+                assert!(matches!(
+                    conn.read_message().await.unwrap(),
+                    Some(Message::Extension { ext_id: 0, .. })
+                ));
+                if after_extension_handshake {
+                    conn.send(&Message::Extension {
+                        ext_id: 0,
+                        payload: Bytes::from_static(
+                            b"d1:md11:ut_metadatai1ee13:metadata_sizei100ee",
+                        ),
+                    })
+                    .await
+                    .unwrap();
+                    assert!(matches!(
+                        conn.read_message().await.unwrap(),
+                        Some(Message::Extension { ext_id: 1, .. })
+                    ));
+                }
+            });
+            let result = timeout(
+                Duration::from_secs(2),
+                fetch_from_peer(&addr, &info_hash, &PeerId([3; 20])),
+            )
+            .await
+            .expect("disconnected peer must not spin or wait for a timeout");
+            let stage = if after_extension_handshake {
+                "during metadata exchange"
+            } else {
+                "before extension handshake"
+            };
+            assert!(matches!(result, Err(Error::Peer(message)) if message.contains(stage)));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn times_out_peer_that_never_replies_to_bittorrent_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = peer_addr(&listener);
+        let (done, wait) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            wait.await.unwrap();
+        });
+        let result = timeout(
+            Duration::from_secs(12),
+            fetch_from_peer(&addr, &InfoHash([1; 20]), &PeerId([2; 20])),
+        )
+        .await
+        .expect("BitTorrent handshake must have its own timeout");
+        assert!(matches!(
+            result,
+            Err(Error::Peer(message)) if message == "BitTorrent handshake timeout"
+        ));
+        done.send(()).unwrap();
+        server.await.unwrap();
     }
 }

@@ -61,6 +61,7 @@ magnet link.
 | `--seed`                | `-s`  | Seed after the download finishes                                 |
 | `--seed-ratio <RATIO>`  |       | Stop seeding when upload/download ratio reaches this value       |
 | `--seed-time <MINUTES>` |       | Stop seeding after this many minutes                             |
+| `--idle-timeout <SECONDS>` |    | Stop after this long without metadata or a verified piece (default: keep trying) |
 | `--quiet`               | `-q`  | Suppress progress bar; print errors only                         |
 | `--verbose`             | `-v`  | Enable debug logging (equivalent to `RUST_LOG=stormdrain=debug`) |
 
@@ -95,6 +96,24 @@ Download and seed until ratio 2.0:
 ```
 stormdrain --seed --seed-ratio 2.0 ubuntu-24.04.torrent
 ```
+
+## Waiting for peers
+
+Magnet metadata resolution and stalled downloads keep discovering and retrying
+peers until the download completes or you press Ctrl-C. Trackers are reannounced
+at their requested intervals; failed trackers and peers use exponential backoff
+(30 seconds up to 10 minutes). Public torrents also repeat DHT lookups.
+
+To stop after five minutes without progress:
+
+```
+stormdrain --idle-timeout 300 "magnet:?xt=urn:btih:..."
+```
+
+Receiving metadata or completing a verified piece resets this timeout. Tracker
+responses, new peers, and unsuccessful connection attempts do not. Seeding is
+controlled separately by the seed options. Library callers can set
+`Config::idle_timeout` to an optional `std::time::Duration`.
 
 ## Resume
 

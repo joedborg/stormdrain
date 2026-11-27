@@ -27,6 +27,7 @@
 
 pub mod bencode;
 pub mod dht;
+mod discovery;
 pub mod download;
 pub mod error;
 pub mod file_writer;

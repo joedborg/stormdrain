@@ -7,6 +7,8 @@
 //! and a `Config` and receive periodic `DownloadStats` via a callback.
 
 use std::{
+    collections::HashMap,
+    future::Future,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -17,11 +19,11 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::Mutex,
     task::JoinSet,
-    time::{sleep, timeout},
+    time::timeout,
 };
 
 use crate::{
-    dht,
+    discovery::{PeerCandidates, PeerDiscovery},
     error::{Error, Result},
     file_writer::FileWriter,
     metainfo::Metainfo,
@@ -55,6 +57,8 @@ pub struct Config {
     pub seed_time: Option<Duration>,
     /// Whether to seed after completing the download.
     pub seed: bool,
+    /// Stop after this long without metadata or a verified piece (None = keep trying).
+    pub idle_timeout: Option<Duration>,
 }
 
 impl Default for Config {
@@ -68,6 +72,7 @@ impl Default for Config {
             seed_ratio: None,
             seed_time: None,
             seed: false,
+            idle_timeout: None,
         }
     }
 }
@@ -97,6 +102,73 @@ pub enum DownloadState {
     Complete,
 }
 
+struct IdleTimer {
+    timeout: Option<Duration>,
+    last_progress: tokio::time::Instant,
+}
+
+impl IdleTimer {
+    fn new(timeout: Option<Duration>) -> Self {
+        Self {
+            timeout,
+            last_progress: tokio::time::Instant::now(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.last_progress = tokio::time::Instant::now();
+    }
+
+    fn check(&self) -> Result<()> {
+        if let Some(timeout) = self.timeout
+            && self.last_progress.elapsed() >= timeout
+        {
+            return Err(Error::IdleTimeout(timeout));
+        }
+        Ok(())
+    }
+}
+
+struct PeerTasks<T> {
+    tasks: JoinSet<Result<T>>,
+    addresses: HashMap<tokio::task::Id, PeerAddr>,
+}
+
+impl<T: Send + 'static> PeerTasks<T> {
+    fn new() -> Self {
+        Self {
+            tasks: JoinSet::new(),
+            addresses: HashMap::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    fn spawn(&mut self, peer: PeerAddr, attempt: impl Future<Output = Result<T>> + Send + 'static) {
+        let task = self.tasks.spawn(attempt);
+        self.addresses.insert(task.id(), peer);
+    }
+
+    async fn next(&mut self) -> Option<(PeerAddr, Result<T>)> {
+        let (id, result) = match self.tasks.join_next_with_id().await? {
+            Ok((id, result)) => (id, result),
+            Err(e) => (e.id(), Err(Error::Peer(format!("peer task failed: {e}")))),
+        };
+        let peer = self
+            .addresses
+            .remove(&id)
+            .expect("peer task has an address");
+        Some((peer, result))
+    }
+
+    async fn shutdown(&mut self) {
+        self.tasks.shutdown().await;
+        self.addresses.clear();
+    }
+}
+
 // Entry point
 /// Download a single torrent, calling `on_progress` approximately once per
 /// second.  Returns when all pieces have been verified and written.
@@ -105,13 +177,40 @@ pub async fn download(
     config: Config,
     on_progress: impl Fn(DownloadStats) + Send + Sync + 'static,
 ) -> Result<()> {
+    let discovery = PeerDiscovery::new(&meta, &config);
+    download_with_discovery(meta, config, on_progress, discovery).await
+}
+
+async fn download_with_discovery(
+    meta: Arc<Metainfo>,
+    config: Config,
+    on_progress: impl Fn(DownloadStats) + Send + Sync + 'static,
+    mut discovery: PeerDiscovery,
+) -> Result<()> {
+    if config.max_peers == 0 {
+        return Err(Error::InvalidConfig(
+            "max_peers must be greater than zero".into(),
+        ));
+    }
+    let on_progress = Arc::new(on_progress);
+    let mut idle = IdleTimer::new(config.idle_timeout);
+    let mut candidates = PeerCandidates::default();
     // Magnet resolution
     // A placeholder Metainfo (from a magnet link) has no pieces; we must fetch
     // the info dict from peers via BEP-9 before we can start downloading.
     let meta = if meta.piece_count() == 0 {
         tracing::info!("Magnet link — fetching metadata via BEP-9...");
-        let real = fetch_magnet_metadata(&meta, &config).await?;
+        let real = fetch_magnet_metadata(
+            &meta,
+            &config,
+            &mut discovery,
+            &mut candidates,
+            &*on_progress,
+            &idle,
+        )
+        .await?;
         tracing::info!("Fetched metadata: '{}'", real.name);
+        idle.reset();
         Arc::new(real)
     } else {
         meta
@@ -140,64 +239,56 @@ pub async fn download(
     let file_writer = Arc::new(FileWriter::new(config.download_dir.clone(), &meta.files).await?);
     let uploaded = Arc::new(std::sync::atomic::AtomicU64::new(resume_state.uploaded));
 
-    let on_progress = Arc::new(on_progress);
     let config = Arc::new(config);
 
-    // Tracker announce(s)
-    let (peers, any_tracker_responded) = announce_all(&meta, &config, Event::Started, 0, 0).await;
-    if peers.is_empty() {
-        return Err(if any_tracker_responded {
-            Error::EmptySwarm
-        } else {
-            Error::NoTrackers
-        });
-    }
-    tracing::info!("Got {} peer(s) from tracker(s)", peers.len());
-
-    // Peer task pool
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(config.max_peers));
-    let mut join_set: JoinSet<()> = JoinSet::new();
+    discovery.update(
+        &meta,
+        piece_mgr.lock().await.downloaded,
+        resume_state.uploaded,
+    );
+    candidates.start_transfer();
+    let mut peers = PeerTasks::new();
+    let mut discovery_open = true;
 
     let mut last_downloaded: u64 = 0;
     let mut last_uploaded: u64 = 0;
     let mut speed_ema: f64 = 0.0;
     let mut up_speed_ema: f64 = 0.0;
     let mut last_saved_pieces: u32 = piece_mgr.lock().await.done_count();
-    let active_peers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-    for peer_addr in peers.into_iter().take(config.max_peers * 3) {
-        // Don't spawn more tasks than we can run concurrently.
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore closed");
-
-        // Short-circuit if already complete.
-        if piece_mgr.lock().await.is_complete() {
-            break;
-        }
-
-        let meta_c = meta.clone();
-        let config_c = config.clone();
-        let piece_mgr_c = piece_mgr.clone();
-        let file_writer_c = file_writer.clone();
-        let active_c = active_peers.clone();
-
-        join_set.spawn(async move {
-            let _permit = permit; // dropped when task ends
-            active_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let res = run_peer(peer_addr, &meta_c, &config_c, &piece_mgr_c, &file_writer_c).await;
-            if let Err(e) = res {
-                tracing::debug!("peer task: {e}");
-            }
-            active_c.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        });
-    }
+    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Progress reporting loop
     loop {
-        sleep(Duration::from_millis(500)).await;
+        while peers.len() < config.max_peers && !piece_mgr.lock().await.is_complete() {
+            let Some(peer_addr) = candidates.next() else {
+                break;
+            };
+            let meta = meta.clone();
+            let config = config.clone();
+            let piece_mgr = piece_mgr.clone();
+            let file_writer = file_writer.clone();
+            peers.spawn(peer_addr, async move {
+                run_peer(peer_addr, &meta, &config, &piece_mgr, &file_writer).await
+            });
+        }
+        tokio::select! {
+            batch = discovery.recv(), if discovery_open => {
+                match batch {
+                    Some(batch) => candidates.add(batch),
+                    None => discovery_open = false,
+                }
+                continue;
+            }
+            Some((peer, result)) = peers.next(), if peers.len() > 0 => {
+                candidates.finished(peer);
+                if let Err(e) = result {
+                    tracing::debug!("Peer {peer}: {e}");
+                }
+                continue;
+            }
+            _ = tick.tick() => {}
+        }
 
         let mgr = piece_mgr.lock().await;
         let downloaded = mgr.downloaded;
@@ -224,6 +315,9 @@ pub async fn download(
         }
 
         let delta = downloaded.saturating_sub(last_downloaded);
+        if delta > 0 {
+            idle.reset();
+        }
         last_downloaded = downloaded;
         let up_total = uploaded.load(std::sync::atomic::Ordering::Relaxed);
         let up_delta = up_total.saturating_sub(last_uploaded);
@@ -238,7 +332,7 @@ pub async fn download(
             0.0
         };
 
-        let peers_active = active_peers.load(std::sync::atomic::Ordering::Relaxed);
+        let peers_active = peers.len();
         let state = if complete {
             DownloadState::Complete
         } else if peers_active == 0 {
@@ -259,6 +353,7 @@ pub async fn download(
             pieces_total,
             state,
         });
+        discovery.update(&meta, downloaded, up_total);
 
         if complete {
             // Save resume state for seeding purposes.
@@ -276,17 +371,12 @@ pub async fn download(
             break;
         }
 
-        // If all spawned tasks are done but not complete, we ran out of peers.
-        if join_set.is_empty() && !complete {
-            return Err(Error::Stalled);
-        }
-
-        // Reap any finished tasks.
-        while join_set.try_join_next().is_some() {}
+        idle.check()?;
     }
 
     // Let remaining peer tasks wind down naturally.
-    join_set.shutdown().await;
+    peers.shutdown().await;
+    drop(discovery);
 
     // Completion announce with actual transfer totals.
     let final_downloaded = piece_mgr.lock().await.downloaded;
@@ -331,7 +421,12 @@ async fn connect_plain(
         .await
         .map_err(|_| Error::Peer("reconnect timeout".into()))??;
     s.set_nodelay(true)?;
-    let hs = handshake::perform(&mut s, info_hash, peer_id).await?;
+    let hs = timeout(
+        Duration::from_secs(10),
+        handshake::perform(&mut s, info_hash, peer_id),
+    )
+    .await
+    .map_err(|_| Error::Peer("plaintext handshake timeout".into()))??;
     Ok((hs, PeerConn::new(s)))
 }
 
@@ -355,16 +450,15 @@ async fn run_peer(
     stream.set_nodelay(true)?;
 
     // Handshake (try MSE first, fall back to plaintext)
-    let (hs, mut conn) = match mse::perform_initiator(stream, &meta.info_hash).await {
-        Ok(mut mse_stream) => {
-            match handshake::perform(&mut mse_stream, meta.info_hash, config.peer_id).await {
-                Ok(hs) => (hs, PeerConn::new(mse_stream)),
-                // MSE succeeded but BEP-3 handshake failed — fall back to plain TCP.
-                Err(_) => connect_plain(sock_addr, meta.info_hash, config.peer_id).await?,
-            }
-        }
-        // MSE negotiation failed — reconnect over plain TCP.
-        Err(_) => connect_plain(sock_addr, meta.info_hash, config.peer_id).await?,
+    let encrypted = timeout(Duration::from_secs(10), async {
+        let mut stream = mse::perform_initiator(stream, &meta.info_hash).await?;
+        let hs = handshake::perform(&mut stream, meta.info_hash, config.peer_id).await?;
+        Ok::<_, Error>((hs, PeerConn::new(stream)))
+    })
+    .await;
+    let (hs, mut conn) = match encrypted {
+        Ok(Ok(connection)) => connection,
+        _ => connect_plain(sock_addr, meta.info_hash, config.peer_id).await?,
     };
     tracing::debug!(
         "Handshake OK with {:?} ext={}",
@@ -376,22 +470,21 @@ async fn run_peer(
     let mut peer_bitfield = vec![false; meta.piece_count() as usize];
 
     // Give the peer up to 3 s to send a BITFIELD before we start.
-    let deadline = Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
-        match conn.read_message_timeout(deadline).await {
-            Ok(Some(Message::Bitfield(bits))) => {
+        match tokio::time::timeout_at(deadline, conn.read_message()).await {
+            Ok(Ok(Some(Message::Bitfield(bits)))) => {
                 peer_bitfield = PieceManager::bitfield_to_vec(&bits, meta.piece_count());
                 break;
             }
-            Ok(Some(Message::Have(idx))) => {
+            Ok(Ok(Some(Message::Have(idx)))) => {
                 if let Some(b) = peer_bitfield.get_mut(idx as usize) {
                     *b = true;
                 }
             }
-            Ok(Some(Message::KeepAlive)) => {}
-            Ok(Some(Message::Extension { .. })) => {} // ignore for now
-            Ok(Some(_)) | Ok(None) => break,          // not a bitfield, proceed
-            Err(_) => break,                          // timeout
+            Ok(Ok(Some(Message::KeepAlive))) => {}
+            Ok(Ok(Some(Message::Extension { .. }))) => {}
+            _ => break,
         }
     }
 
@@ -511,6 +604,7 @@ async fn download_piece(
     let mut received = vec![false; num_blocks];
     let mut blocks_done = 0usize;
     let mut next_request = 0usize; // next block index to request
+    let mut deadline = tokio::time::Instant::now() + Duration::from_secs(30);
 
     while blocks_done < num_blocks {
         // Fill the request pipeline.
@@ -531,7 +625,10 @@ async fn download_piece(
         }
 
         // Read next message.
-        match conn.read_message_timeout(Duration::from_secs(30)).await? {
+        match tokio::time::timeout_at(deadline, conn.read_message())
+            .await
+            .map_err(|_| Error::Peer("no piece data received for 30 seconds".into()))??
+        {
             Some(Message::Piece { index, begin, data }) => {
                 if index != piece_idx {
                     // Stale response for a different piece — ignore.
@@ -544,6 +641,7 @@ async fn download_piece(
                     piece_data[start..end].copy_from_slice(&data[..end - start]);
                     received[block_idx] = true;
                     blocks_done += 1;
+                    deadline = tokio::time::Instant::now() + Duration::from_secs(30);
                 }
             }
             Some(Message::Choke) => {
@@ -578,7 +676,13 @@ async fn announce_all(
     let info_hash = meta.info_hash;
     let peer_id = config.peer_id;
     let port = config.listen_port;
-    let left = meta.total_length.saturating_sub(downloaded);
+    // Unknown magnet size is not a completed download: trackers may omit
+    // seed peers when we announce left=0.
+    let left = if meta.piece_count() == 0 && event == Event::Started {
+        1
+    } else {
+        meta.total_length.saturating_sub(downloaded)
+    };
     // Independent tiers run concurrently; fallback within a tier stays ordered.
     for tier in &meta.trackers {
         let tier = tier.clone();
@@ -632,19 +736,6 @@ async fn announce_all(
         }
     }
 
-    // DHT fallback: if no peers from any tracker, query the DHT.
-    if all_peers.is_empty() && event == Event::Started {
-        tracing::warn!("No tracker peers; trying DHT...");
-        match dht::Dht::start().await {
-            Ok(dht) => {
-                let peers = dht.get_peers(meta.info_hash, 50).await;
-                tracing::warn!("DHT: {} peers", peers.len());
-                all_peers.extend(peers);
-            }
-            Err(e) => tracing::warn!("DHT start failed: {e}"),
-        }
-    }
-
     // Deduplicate.
     all_peers.sort_unstable();
     all_peers.dedup();
@@ -653,34 +744,67 @@ async fn announce_all(
 
 /// Fetch full `Metainfo` from peers using BEP-9 (ut_metadata extension).
 /// Used when only a magnet link was provided.
-async fn fetch_magnet_metadata(placeholder: &Metainfo, config: &Config) -> Result<Metainfo> {
-    // Collect peers from tracker(s) embedded in the magnet link, then DHT.
-    let (mut peers, _) = announce_all(placeholder, config, Event::Started, 0, 0).await;
-    if peers.is_empty() {
-        // Trackers might be missing (DHT-only magnet).
-        match dht::Dht::start().await {
-            Ok(dht) => peers.extend(dht.get_peers(placeholder.info_hash, 50).await),
-            Err(e) => tracing::debug!("DHT start failed: {e}"),
+async fn fetch_magnet_metadata(
+    placeholder: &Metainfo,
+    config: &Config,
+    discovery: &mut PeerDiscovery,
+    candidates: &mut PeerCandidates,
+    on_progress: &(dyn Fn(DownloadStats) + Send + Sync),
+    idle: &IdleTimer,
+) -> Result<Metainfo> {
+    let concurrency = config.max_peers.clamp(1, 8);
+    let mut attempts = PeerTasks::new();
+    let mut discovery_open = true;
+    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        while attempts.len() < concurrency {
+            let Some(peer) = candidates.next() else {
+                break;
+            };
+            let peer_id = config.peer_id;
+            let info_hash = placeholder.info_hash;
+            attempts.spawn(peer, async move {
+                metadata_exchange::fetch_from_peer(&peer, &info_hash, &peer_id).await
+            });
         }
-    }
-    if peers.is_empty() {
-        return Err(Error::NoTrackers);
-    }
-    for peer in peers.iter().take(20) {
-        match metadata_exchange::fetch_from_peer(peer, &placeholder.info_hash, &config.peer_id)
-            .await
-        {
-            Ok(mut meta) => {
-                // BEP-9 transfers only the info dict, not the tracker URLs.
-                meta.trackers = placeholder.trackers.clone();
-                return Ok(meta);
+        tokio::select! {
+            batch = discovery.recv(), if discovery_open => {
+                match batch {
+                    Some(batch) => candidates.add(batch),
+                    None => discovery_open = false,
+                }
             }
-            Err(e) => tracing::debug!("BEP-9 from {peer}: {e}"),
+            Some((peer, result)) = attempts.next(), if attempts.len() > 0 => {
+                candidates.finished(peer);
+                match result {
+                    Ok(mut meta) => {
+                        tracing::info!("Fetched magnet metadata from {peer}");
+                        attempts.shutdown().await;
+                        meta.trackers = placeholder.trackers.clone();
+                        discovery.update(&meta, 0, 0);
+                        return Ok(meta);
+                    }
+                    Err(e) => tracing::debug!("BEP-9 from {peer}: {e}"),
+                }
+            }
+            _ = tick.tick() => {
+                on_progress(DownloadStats {
+                    downloaded: 0,
+                    uploaded: 0,
+                    total: 0,
+                    progress: 0.0,
+                    download_speed: 0.0,
+                    upload_speed: 0.0,
+                    peers_active: attempts.len(),
+                    pieces_done: 0,
+                    pieces_total: 0,
+                    state: DownloadState::Connecting,
+                });
+                idle.check()?;
+            }
         }
     }
-    Err(Error::Peer(
-        "could not fetch torrent metadata from any peer".into(),
-    ))
 }
 
 async fn announce_all_no_err(
@@ -824,7 +948,245 @@ async fn serve_peer(
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::{io::AsyncReadExt, net::UdpSocket};
+
+    fn test_metainfo(magnet: bool) -> Metainfo {
+        if magnet {
+            Metainfo::placeholder_magnet(&crate::magnet::MagnetLink {
+                info_hash: InfoHash([1; 20]),
+                name: None,
+                trackers: Vec::new(),
+            })
+        } else {
+            let mut info = b"d6:lengthi4e4:name8:test.txt12:piece lengthi4e6:pieces20:".to_vec();
+            info.extend_from_slice(&Sha1::digest(b"test"));
+            info.push(b'e');
+            Metainfo::from_info_bytes(&info, &InfoHash(Sha1::digest(&info).into())).unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn verified_pieces_reset_idle_timeout_during_longer_download() {
+        timeout(Duration::from_secs(5), async {
+            let mut info = b"d6:lengthi8e4:name8:test.txt12:piece lengthi4e6:pieces40:".to_vec();
+            info.extend_from_slice(&Sha1::digest(b"test"));
+            info.extend_from_slice(&Sha1::digest(b"test"));
+            info.push(b'e');
+            let info_hash = InfoHash(Sha1::digest(&info).into());
+            let meta = Metainfo::from_info_bytes(&info, &info_hash).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream.read_exact(&mut [0u8; 96]).await.unwrap();
+                drop(stream);
+                let (mut stream, _) = listener.accept().await.unwrap();
+                handshake::perform(&mut stream, info_hash, PeerId([7; 20])).await.unwrap();
+                let mut conn = PeerConn::new(stream);
+                conn.send(&Message::Bitfield(vec![0xc0])).await.unwrap();
+                conn.send(&Message::Unchoke).await.unwrap();
+                assert!(matches!(conn.read_message().await.unwrap(), Some(Message::Interested)));
+                for index in 0..2 {
+                    assert!(matches!(
+                        conn.read_message().await.unwrap(),
+                        Some(Message::Request { index: received, begin: 0, length: 4 }) if received == index
+                    ));
+                    tokio::time::sleep(Duration::from_millis(1100)).await;
+                    conn.send(&Message::Piece {
+                        index,
+                        begin: 0,
+                        data: Bytes::from_static(b"test"),
+                    }).await.unwrap();
+                }
+            });
+            let (discovery, sender) = PeerDiscovery::injected(&meta);
+            sender.send(vec![PeerAddr { ip: addr.ip(), port: addr.port() }]).await.unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            download_with_discovery(
+                Arc::new(meta),
+                Config {
+                    idle_timeout: Some(Duration::from_secs(2)),
+                    download_dir: dir.path().to_owned(),
+                    ..Config::default()
+                },
+                |_| {},
+                discovery,
+            ).await.unwrap();
+            assert_eq!(tokio::fs::read(dir.path().join("test.txt")).await.unwrap(), b"testtest");
+            server.await.unwrap();
+        }).await.expect("download with regular piece progress timed out");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_stops_metadata_and_stalled_downloads_and_closes_discovery() {
+        for magnet in [true, false] {
+            let meta = test_metainfo(magnet);
+            let dir = tempfile::tempdir().unwrap();
+            let (discovery, sender) = PeerDiscovery::injected(&meta);
+            let repeated = sender.clone();
+            let mut source = JoinSet::new();
+            source.spawn(async move {
+                while repeated.send(Vec::new()).await.is_ok() {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            });
+            let result = download_with_discovery(
+                Arc::new(meta),
+                Config {
+                    idle_timeout: Some(Duration::from_secs(3)),
+                    download_dir: dir.path().to_owned(),
+                    ..Config::default()
+                },
+                |stats| {
+                    assert_eq!(stats.state, DownloadState::Connecting);
+                    assert_eq!(stats.downloaded, 0);
+                },
+                discovery,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(Error::IdleTimeout(duration)) if duration == Duration::from_secs(3))
+            );
+            assert!(sender.is_closed());
+            source.shutdown().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_waits_indefinitely_and_cancellation_closes_discovery() {
+        for magnet in [true, false] {
+            let meta = test_metainfo(magnet);
+            let dir = tempfile::tempdir().unwrap();
+            let (discovery, sender) = PeerDiscovery::injected(&meta);
+            let reports = Arc::new(AtomicUsize::new(0));
+            let on_progress = reports.clone();
+            let task = tokio::spawn(download_with_discovery(
+                Arc::new(meta),
+                Config {
+                    download_dir: dir.path().to_owned(),
+                    ..Config::default()
+                },
+                move |_| {
+                    on_progress.fetch_add(1, Ordering::Relaxed);
+                },
+                discovery,
+            ));
+            while reports.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(Duration::from_secs(3600)).await;
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished());
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert!(sender.is_closed());
+        }
+    }
+
+    #[tokio::test]
+    async fn fetches_metadata_beyond_first_twenty_peers_without_waiting_for_silent_peer() {
+        timeout(Duration::from_secs(5), async {
+            let mut info = b"d6:lengthi4e4:name8:test.txt12:piece lengthi4e6:pieces20:".to_vec();
+            info.extend_from_slice(&Sha1::digest(b"test"));
+            info.push(b'e');
+            let info_hash = InfoHash(Sha1::digest(&info).into());
+            let mut peers = Vec::new();
+            let mut servers = JoinSet::new();
+
+            let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = silent.local_addr().unwrap();
+            peers.push(PeerAddr {
+                ip: addr.ip(),
+                port: addr.port(),
+            });
+            let (closed, wait_for_close) = tokio::sync::oneshot::channel();
+            servers.spawn(async move {
+                let (mut stream, _) = silent.accept().await.unwrap();
+                let mut handshake = [0u8; 68];
+                stream.read_exact(&mut handshake).await.unwrap();
+                // A successful attempt must cancel this stalled connection.
+                assert_eq!(stream.read(&mut handshake).await.unwrap(), 0);
+                closed.send(()).unwrap();
+            });
+            for _ in 0..21 {
+                let rejected = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = rejected.local_addr().unwrap();
+                peers.push(PeerAddr {
+                    ip: addr.ip(),
+                    port: addr.port(),
+                });
+                servers.spawn(async move {
+                    let (mut stream, _) = rejected.accept().await.unwrap();
+                    stream.read_exact(&mut [0u8; 68]).await.unwrap();
+                });
+            }
+            let healthy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = healthy.local_addr().unwrap();
+            peers.push(PeerAddr {
+                ip: addr.ip(),
+                port: addr.port(),
+            });
+            servers.spawn(async move {
+                let (mut stream, _) = healthy.accept().await.unwrap();
+                handshake::perform(&mut stream, info_hash, PeerId([7; 20]))
+                    .await
+                    .unwrap();
+                let mut conn = PeerConn::new(stream);
+                assert!(matches!(
+                    conn.read_message().await.unwrap(),
+                    Some(Message::Extension { ext_id: 0, .. })
+                ));
+                conn.send(&Message::Extension {
+                    ext_id: 0,
+                    payload: Bytes::from(format!(
+                        "d1:md11:ut_metadatai42ee13:metadata_sizei{}ee",
+                        info.len()
+                    )),
+                })
+                .await
+                .unwrap();
+                assert!(matches!(
+                    conn.read_message().await.unwrap(),
+                    Some(Message::Extension { ext_id: 42, .. })
+                ));
+                let mut payload = b"d8:msg_typei1e5:piecei0ee".to_vec();
+                payload.extend_from_slice(&info);
+                conn.send(&Message::Extension {
+                    ext_id: 1,
+                    payload: Bytes::from(payload),
+                })
+                .await
+                .unwrap();
+            });
+            let placeholder = Metainfo::placeholder_magnet(&crate::magnet::MagnetLink {
+                info_hash,
+                name: None,
+                trackers: Vec::new(),
+            });
+            let (mut discovery, sender) = PeerDiscovery::injected(&placeholder);
+            sender.send(peers).await.unwrap();
+            let meta = fetch_magnet_metadata(
+                &placeholder,
+                &Config::default(),
+                &mut discovery,
+                &mut PeerCandidates::default(),
+                &|_| {},
+                &IdleTimer::new(None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(meta.info_hash, info_hash);
+            assert_eq!(meta.name, "test.txt");
+            assert_eq!(meta.total_length, 4);
+            wait_for_close.await.unwrap();
+            while let Some(result) = servers.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .expect("a stalled peer must not block metadata from later peers");
+    }
 
     #[tokio::test]
     async fn announces_independent_tracker_tiers_concurrently() {
@@ -923,7 +1285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn downloads_magnet_using_hostname_tracker_after_metadata_exchange() {
+    async fn downloads_magnet_after_empty_swarm_and_later_recovers_from_stalled_data_peer() {
         timeout(Duration::from_secs(5), async {
             let content = b"test";
             let mut info = b"d6:lengthi4e4:name8:test.txt12:piece lengthi4e6:pieces20:".to_vec();
@@ -932,6 +1294,8 @@ mod tests {
             let info_hash = InfoHash(Sha1::digest(&info).into());
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let peer_addr = listener.local_addr().unwrap();
+            let data_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let data_addr = data_listener.local_addr().unwrap();
             let tracker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let tracker_url = format!(
                 "udp://localhost:{}/announce",
@@ -940,7 +1304,12 @@ mod tests {
 
             let tracker_task = tokio::spawn(async move {
                 let mut buf = [0u8; 1024];
-                for left in [0u64, 4, 0] {
+                for (left, event, peer) in [
+                    (1u64, 2u32, None),
+                    (1, 0, Some(peer_addr)),
+                    (4, 0, Some(data_addr)),
+                    (0, 1, Some(data_addr)),
+                ] {
                     let (n, client) = tracker.recv_from(&mut buf).await.unwrap();
                     assert_eq!(n, 16);
                     assert_eq!(&buf[..8], &0x0000041727101980u64.to_be_bytes());
@@ -952,12 +1321,15 @@ mod tests {
                     assert_eq!(n, 98);
                     assert_eq!(&buf[16..36], info_hash.as_bytes());
                     assert_eq!(&buf[64..72], &left.to_be_bytes());
+                    assert_eq!(&buf[80..84], &event.to_be_bytes());
                     let mut response = buf[8..16].to_vec();
-                    response.extend_from_slice(&1800u32.to_be_bytes());
+                    response.extend_from_slice(&1u32.to_be_bytes());
                     response.extend_from_slice(&0u32.to_be_bytes());
                     response.extend_from_slice(&1u32.to_be_bytes());
-                    response.extend_from_slice(&[127, 0, 0, 1]);
-                    response.extend_from_slice(&peer_addr.port().to_be_bytes());
+                    if let Some(peer) = peer {
+                        response.extend_from_slice(&[127, 0, 0, 1]);
+                        response.extend_from_slice(&peer.port().to_be_bytes());
+                    }
                     tracker.send_to(&response, client).await.unwrap();
                 }
             });
@@ -998,12 +1370,14 @@ mod tests {
                 .await
                 .unwrap();
                 drop(conn);
+                // This metadata peer goes offline before file transfer.
+                drop(listener);
 
                 // Reject MSE so the downloader reconnects using plaintext.
-                let (mut stream, _) = listener.accept().await.unwrap();
+                let (mut stream, _) = data_listener.accept().await.unwrap();
                 stream.read_exact(&mut [0u8; 96]).await.unwrap();
                 drop(stream);
-                let (mut stream, _) = listener.accept().await.unwrap();
+                let (mut stream, _) = data_listener.accept().await.unwrap();
                 handshake::perform(&mut stream, info_hash, PeerId([7; 20]))
                     .await
                     .unwrap();
@@ -1037,14 +1411,16 @@ mod tests {
                 "magnet:?xt=urn:btih:{}&dn=Test%20Download&tr={encoded_tracker}",
                 info_hash.to_hex().to_uppercase()
             );
-            let (placeholder, _) = crate::resolve_source(&source).await.unwrap();
+            let (mut placeholder, _) = crate::resolve_source(&source).await.unwrap();
+            placeholder.is_private = true; // Keep this local fixture off the public DHT.
             let dir = tempfile::tempdir().unwrap();
             let config = Config {
                 download_dir: dir.path().to_owned(),
+                idle_timeout: Some(Duration::from_secs(2)),
                 ..Config::default()
             };
             download(Arc::new(placeholder), config, |stats| {
-                assert_eq!(stats.total, 4);
+                assert!(stats.total == 0 || stats.total == 4);
             })
             .await
             .unwrap();

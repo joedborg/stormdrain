@@ -62,6 +62,10 @@ pub struct Args {
     #[arg(long = "seed-time", value_name = "MINUTES")]
     pub seed_time: Option<u64>,
 
+    /// Stop after this many seconds without metadata or a verified piece (default: keep trying).
+    #[arg(long = "idle-timeout", value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+    pub idle_timeout: Option<u64>,
+
     /// Suppress the progress bar and only print errors.
     #[arg(short = 'q', long = "quiet")]
     pub quiet: bool,
@@ -69,4 +73,19 @@ pub struct Args {
     /// Enable verbose/debug logging (can also set RUST_LOG env var).
     #[arg(short = 'v', long = "verbose")]
     pub verbose: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_positive_idle_timeout_and_rejects_zero() {
+        let args =
+            Args::try_parse_from(["stormdrain", "--idle-timeout", "300", "test.torrent"]).unwrap();
+        assert_eq!(args.idle_timeout, Some(300));
+        assert!(
+            Args::try_parse_from(["stormdrain", "--idle-timeout", "0", "test.torrent"]).is_err()
+        );
+    }
 }

@@ -5,6 +5,12 @@ use thiserror::Error;
 /// The error type for all stormdrain operations.
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
+
+    #[error("No download progress for {0:?} (idle timeout)")]
+    IdleTimeout(std::time::Duration),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 

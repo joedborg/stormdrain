@@ -68,7 +68,8 @@ pub async fn announce(req: &AnnounceRequest<'_>, url: &str) -> Result<AnnounceRe
     ann[64..72].copy_from_slice(&req.left.to_be_bytes());
     ann[72..80].copy_from_slice(&req.uploaded.to_be_bytes());
     let event_code: u32 = match req.event {
-        None | Some(Event::Started) => 2, // "started" = 2 in UDP
+        None => 0,
+        Some(Event::Started) => 2,
         Some(Event::Completed) => 1,
         Some(Event::Stopped) => 3,
     };

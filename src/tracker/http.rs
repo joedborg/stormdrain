@@ -88,7 +88,14 @@ fn parse_response(body: &[u8]) -> Result<AnnounceResponse> {
     let interval = val
         .get(b"interval")
         .and_then(|v| v.as_int())
+        .filter(|&interval| interval > 0)
         .unwrap_or(1800) as u64;
+    let interval = interval.max(
+        val.get(b"min interval")
+            .and_then(|v| v.as_int())
+            .filter(|&interval| interval > 0)
+            .unwrap_or(0) as u64,
+    );
 
     let mut peers = Vec::new();
 
@@ -143,4 +150,15 @@ fn parse_response(body: &[u8]) -> Result<AnnounceResponse> {
         interval,
         warning,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn respects_tracker_minimum_reannounce_interval() {
+        let response = parse_response(b"d8:intervali30e12:min intervali120e5:peers0:e").unwrap();
+        assert_eq!(response.interval, 120);
+    }
 }
